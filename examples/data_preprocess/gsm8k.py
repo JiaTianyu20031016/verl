@@ -98,6 +98,7 @@ if __name__ == "__main__":
 
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))
+    print("Preprocessed dataset saved to {}".format(local_save_dir))
 
     if hdfs_dir is not None:
         makedirs(hdfs_dir)

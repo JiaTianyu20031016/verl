@@ -823,7 +823,7 @@ def compute_rollout_correction_and_add_to_batch(
     - Metrics can be monitored before enabling IS weight correction
 
     Args:
-        batch: DataProto with old_log_probs, rollout_log_probs, response_mask
+        batch: DataProto with old_log_probs,  , response_mask
 
     Returns:
         Tuple of (updated_batch, metrics):
