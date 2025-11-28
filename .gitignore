@@ -1,5 +1,6 @@
 
 **/*.pt
+**/*.whl
 **/checkpoints
 **/wget-log
 **/_build/
@@ -9,6 +10,7 @@
 **/playground
 **/wandb
 **/data
+**/machine_spec
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -68,9 +68,18 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
+        # for using ray debugger
+        # if "env_vars" not in runtime_env_kwargs:
+        #    runtime_env_kwargs["env_vars"] = {}
+        # runtime_env_kwargs["env_vars"]["RAY_DEBUG"] = "1"
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
+        
+        # for using python debugger, we need to set local_mode=True
+        # ray_init_kwargs['local_mode'] = True
+        
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
