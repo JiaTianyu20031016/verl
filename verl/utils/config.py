@@ -16,8 +16,15 @@ from dataclasses import is_dataclass
 from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
-__all__ = ["omega_conf_to_dataclass", "validate_config"]
+
+__all__ = ["omega_conf_to_dataclass", "validate_config", "is_overridden_by_cli"]
+
+
+def is_overridden_by_cli(key: str) -> bool:
+    overrides = HydraConfig.get().overrides.task  # 所有命令行覆盖
+    return any(ov.startswith(key + "=") or ov.startswith(key + ".") for ov in overrides)
 
 
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:

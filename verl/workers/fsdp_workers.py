@@ -16,6 +16,8 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+import re
+import copy
 import json
 import logging
 import os
@@ -1924,6 +1926,1273 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         return output
 
 
+
+
+# ================= Generative (LLM-as-a-Judge) Reward Model Worker =================
+class GenerativeRewardModelWorker(Worker, DistProfilerExtension):
+    """Generative reward model (LLM-as-a-Judge).
+
+    It mirrors RewardModelWorker interface so the trainer can call compute_rm_score transparently.
+    Core difference: builds judge prompts from (prompt,response) pairs, calls a causal LM judge to
+    generate an evaluation text, parses a numeric score, expands to sparse token-level reward.
+
+    Required in config:
+      config.model.path: HF causal LM judge model path/name
+    Optional fields (with defaults):
+      judge_prompt_template, judge_max_new_tokens, judge_temperature,
+      judge_score_pattern, judge_score_min, judge_score_max, judge_normalize,
+      judge_input_max_length.
+    """
+
+    def __init__(self, config):
+        Worker.__init__(self)
+        omega_profiler_config = config.get("profiler", {})
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self,
+            DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
+        )
+
+        import torch.distributed
+        self.config = config
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend=get_nccl_backend(),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+
+        world_size = torch.distributed.get_world_size()
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+
+        # Ulysses sequence parallel
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            from torch.distributed.device_mesh import init_device_mesh
+            self.ulysses_device_mesh = init_device_mesh(
+                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+            )
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        if self.ulysses_device_mesh is not None:
+            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+            self._register_dispatch_collect_info(
+                "reward", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+            )
+        else:
+            self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
+
+        # normalize micro batch size per GPU (same convention as RewardModelWorker)
+        if self.config.micro_batch_size is not None:
+            self.config.micro_batch_size //= torch.distributed.get_world_size()
+            self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
+
+        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+
+        # prompt & score parsing settings
+        self.judge_template = self.config.get(
+            "judge_prompt_template",
+            (
+                "You are an impartial evaluator. Given a user prompt and a model response, "
+                "provide ONLY a numeric score in the format: Score: <number>\n\n"
+                "Criteria: helpfulness, correctness, relevance. Range: 0-10.\n\n"
+                "[Prompt]\n{prompt}\n\n[Response]\n{response}\n\nScore:"
+            ),
+        )
+        self.score_pattern = re.compile(
+            self.config.get("judge_score_pattern", r"Score:\s*(\d+(?:\.\d+)?)"), flags=re.IGNORECASE
+        )
+        self.score_min = float(self.config.get("judge_score_min", 0.0))
+        self.score_max = float(self.config.get("judge_score_max", 10.0))
+        self.normalize_score = bool(self.config.get("judge_normalize", True))
+        self.max_new_tokens = int(self.config.get("judge_max_new_tokens", 64))
+        self.temperature = float(self.config.get("judge_temperature", 0.1))
+
+    def _build_model(self, config):
+        from torch.distributed.fsdp import CPUOffload
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        use_shm = config.model.get("use_shm", False)
+        local_path = copy_to_local(config.model.path, use_shm=use_shm)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
+        trust_remote_code = config.model.get("trust_remote_code", False)
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not getattr(model_config, "tie_word_embeddings", False), mesh=self.device_mesh
+        )
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            judge_module = AutoModelForCausalLM.from_pretrained(
+                local_path,
+                config=model_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            )
+            apply_monkey_patch(
+                model=judge_module,
+                use_remove_padding=config.model.get("use_remove_padding", False),
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            )
+            judge_module.to(torch.bfloat16)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=judge_module,
+            config=self.config.model.fsdp_config,
+            is_lora=False,
+        )
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        if config.strategy == "fsdp":
+            judge_module = FSDP(
+                judge_module,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,
+                sync_module_states=True,
+                cpu_offload=CPUOffload(offload_params=True),
+                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
+                device_mesh=self.device_mesh,
+            )
+        elif config.strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "FSDP2 requires newer torch"
+            cpu_offload = CPUOffloadPolicy(pin_memory=True)
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "offload_policy": cpu_offload,
+                "reshard_after_forward": config.model.fsdp_config.reshard_after_forward,
+                "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
+            }
+            full_state = judge_module.state_dict()
+            apply_fsdp2(judge_module, fsdp_kwargs, config.model.fsdp_config)
+            fsdp2_load_full_state_dict(judge_module, full_state, fsdp_mesh, cpu_offload)
+        else:
+            raise NotImplementedError(f"Unknown strategy {config.strategy}")
+        return judge_module
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        import_external_libs(self.config.model.get("external_lib", None))
+        self.judge_module = self._build_model(self.config)
+
+    def _build_judge_inputs(self, data: DataProto) -> list[str]:
+        tokenizer = self.tokenizer
+        batch_size = data.batch.batch_size[0]
+        attention_mask = data.batch["attention_mask"]
+        input_ids = data.batch.get("input_ids")
+        responses = data.batch.get("responses")
+        prompts = data.batch.get("prompts")
+        judge_texts = []
+        for i in range(batch_size):
+            if prompts is not None and responses is not None:
+                # Case 1: explicit prompt/response ids provided
+                prompt_ids = prompts[i]
+                response_ids = responses[i]
+                prompt_len_total = prompt_ids.shape[-1]
+                valid_prompt_len = attention_mask[i][:prompt_len_total].sum()
+                valid_response_len = attention_mask[i][prompt_len_total:].sum()
+                prompt_str = tokenizer.decode(prompt_ids[-valid_prompt_len:], skip_special_tokens=True)
+                response_str = tokenizer.decode(response_ids[:valid_response_len], skip_special_tokens=True)
+            else:
+                # Case 2: only concatenated input_ids and responses length provided
+                ids = input_ids[i]
+                # responses tensor gives the nominal response window length at the tail
+                response_window_len = responses[i].shape[-1]
+                prompt_window_len = ids.shape[-1] - response_window_len
+                # valid lengths are determined by attention_mask in each segment
+                valid_prompt_len = attention_mask[i][:prompt_window_len].sum()
+                valid_response_len = attention_mask[i][-response_window_len:].sum()
+                # take last valid tokens from prompt segment, and first valid tokens from response segment
+                prompt_segment = ids[:prompt_window_len]
+                response_segment = ids[-response_window_len:]
+                prompt_ids_valid = prompt_segment[-valid_prompt_len:]
+                response_ids_valid = response_segment[:valid_response_len]
+                prompt_str = tokenizer.decode(prompt_ids_valid, skip_special_tokens=True)
+                response_str = tokenizer.decode(response_ids_valid, skip_special_tokens=True)
+            judge_prompt = self.judge_template.format(prompt=prompt_str, response=response_str)
+            judge_texts.append(judge_prompt)
+        return judge_texts
+
+    def _forward_micro_batch(self, judge_texts: list[str]) -> torch.Tensor:
+        enc = self.tokenizer(
+            judge_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.config.get("judge_input_max_length", 4096),
+        )
+        input_ids = enc["input_ids"].to(get_device_id())
+        attention_mask = enc["attention_mask"].to(get_device_id())
+        with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+            gen_out = self.judge_module.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.temperature > 0,
+                temperature=self.temperature,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        gen_texts = []
+        for i in range(gen_out.shape[0]):
+            orig_len = (attention_mask[i] == 1).sum().item()
+            new_tokens = gen_out[i][orig_len:]
+            text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            gen_texts.append(text)
+        scores = []
+        for txt in gen_texts:
+            m = self.score_pattern.search(txt)
+            if m:
+                val = float(m.group(1))
+            else:
+                val = 0.0
+            val = max(self.score_min, min(self.score_max, val))
+            if self.normalize_score and self.score_max > self.score_min:
+                val = (val - self.score_min) / (self.score_max - self.score_min)
+            scores.append(val)
+        return torch.tensor(scores, dtype=torch.float32, device=get_device_id())
+
+    def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor) -> torch.Tensor:
+        attention_mask = data.batch["attention_mask"]
+        position_ids = data.batch["position_ids"]
+        response_length = data.batch["responses"].shape[-1]
+        if position_ids.dim() == 3:
+            position_ids = position_ids[:, 0, :]
+        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
+        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
+        token_level_scores[torch.arange(scores.size(0)), eos_mask_idx] = scores
+        token_level_scores = token_level_scores[:, -response_length:]
+        return token_level_scores
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="orange")
+    def compute_rm_score(self, data: DataProto):
+        data = data.to(get_device_id())
+        judge_texts = self._build_judge_inputs(data)
+        micro_bsz = self.config.get("micro_batch_size_per_gpu", len(judge_texts))
+        outputs = []
+        for start in range(0, len(judge_texts), micro_bsz):
+            mb_texts = judge_texts[start : start + micro_bsz]
+            mb_scores = self._forward_micro_batch(mb_texts)
+            outputs.append(mb_scores)
+        scores = torch.cat(outputs, dim=0)
+        token_level_scores = self._expand_to_token_level(data, scores)
+        output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+        if self.device_mesh.size() > 1 and fsdp_version(getattr(self, "judge_module", None)) == 1:
+            try:
+                self.judge_module._handle.reshard(True)
+            except Exception:
+                pass
+        output = output.to("cpu")
+        return output
+
+
+# ================= Dual-LoRA Actor + Generative RM Worker =================
+class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
+    """
+    A composite worker that hosts one shared backbone model and two LoRA adapters
+    (actor1, actor2). It exposes Actor-like methods for both actors by switching
+    adapters, and RewardModel-like methods by using actor1 as LLM-as-a-Judge to
+    score (prompt,response) pairs.
+
+    Key design:
+    - Single backbone (FSDP-wrapped) to save memory
+    - Two LoRA adapters loaded and toggled via adapter names (actor1/actor2)
+    - Actor methods honor current adapter; reward scoring uses actor1 adapter
+    - Reuses rollout/compute_log_prob/update logic from ActorRolloutRefWorker
+    """
+
+    def __init__(self, config: DictConfig):
+        # 与 ActorRolloutRefWorker 保持一致的初始化框架
+        Worker.__init__(self)
+        self.config = config
+
+        omega_profiler_config = config.actor.get("profiler", {})
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+        )
+
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            torch.distributed.init_process_group(
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                rank=rank,
+                world_size=world_size,
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+
+        # 设备网格与 Ulysses 设置与原类保持一致
+        world_size = torch.distributed.get_world_size()
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh(
+                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+            )
+        # dispatch 注册与原类保持一致
+        if self.ulysses_device_mesh is not None:
+            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+            self._register_dispatch_collect_info(
+                "actor", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+            )
+        else:
+            self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        # 也为 reward mesh 注册收集信息（供 compute_rm_score 使用）
+        if self.ulysses_device_mesh is not None:
+            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+            self._register_dispatch_collect_info(
+                "reward", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+            )
+        else:
+            self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
+
+        # 与原类相同的 LoRA / offload / use_orig_params 标记
+        self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
+        self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
+        self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
+
+        # 归一化 batch 配置（与 ActorRolloutRefWorker 同步）
+        self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+        self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
+        if self.config.actor.ppo_micro_batch_size is not None:
+            self.config.actor.ppo_micro_batch_size //= (
+                self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            )
+            self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
+        if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
+            assert (
+                self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
+            ), "normalized ppo_mini_batch_size should be divisible by ppo_micro_batch_size_per_gpu"
+
+        # rollout log_prob 归一化（需要用于 compute_log_prob 逻辑）
+        if self.config.rollout.log_prob_micro_batch_size is not None:
+            self.config.rollout.log_prob_micro_batch_size //= (
+                self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            )
+            self.config.rollout.log_prob_micro_batch_size_per_gpu = self.config.rollout.log_prob_micro_batch_size
+
+        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+
+        # Judge 配置（供 RM 打分）
+        self.judge_template = self.config.get(
+            "judge_prompt_template",
+            (
+                "You are an impartial evaluator. Given a user prompt and a model response, "
+                "provide ONLY a numeric score in the format: Score: <number>\n\n"
+                "Criteria: helpfulness, correctness, relevance. Range: 0-10.\n\n"
+                "[Prompt]\n{prompt}\n\n[Response]\n{response}\n\nScore:"
+            ),
+        )
+        self.score_pattern = re.compile(
+            self.config.get("judge_score_pattern", r"Score:\s*(\d+(?:\.\d+)?)"), flags=re.IGNORECASE
+        )
+        self.score_min = float(self.config.get("judge_score_min", 0.0))
+        self.score_max = float(self.config.get("judge_score_max", 10.0))
+        self.normalize_score = bool(self.config.get("judge_normalize", True))
+        self.max_new_tokens = int(self.config.get("judge_max_new_tokens", 64))
+        self.temperature = float(self.config.get("judge_temperature", 0.1))
+
+        # 当前适配器：actor1/actor2
+        self.current_adapter = "actor1"
+
+    # ---------- Minimal helpers for judge-aware config picking ----------
+    def _get_effective_rollout_cfg(self, adapter_name: str):
+        """Return rollout config; use judge.rollout if adapter is actor1 and available."""
+        # try:
+        #     if adapter_name == "actor1" and hasattr(self.config, "judge") and hasattr(self.config.judge, "rollout"):
+        #         return self.config.judge.rollout
+        # except Exception:
+        #     pass
+        return self.config.rollout
+
+    def _get_judge_actor_model_cfg(self):
+        """Return judge.model config if available, else fallback to top-level model config."""
+        # try:
+        #     if hasattr(self.config, "judge") and hasattr(self.config.judge, "model"):
+        #         return self.config.judge.model
+        # except Exception:
+        #     pass
+        return self.config.model
+
+    def _build_dual_lora_actor(self):
+        """直接内联原 _build_model_optimizer 逻辑，并创建两套 LoRA 适配器与优化器。"""
+        from transformers import (
+            AutoConfig,
+            AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForVision2Seq,
+        )
+        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.torch_dtypes import PrecisionType
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision
+
+        fsdp_config = omega_conf_to_dataclass(self.config.actor.fsdp_config, dataclass_type=FSDPEngineConfig)
+        optim_config = self.config.actor.optim
+        override_model_config = OmegaConf.to_container(
+            OmegaConf.create(self.config.model.get("override_config", {}))
+        )
+        use_remove_padding = self.config.model.get("use_remove_padding", False)
+        use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        use_shm = self.config.model.get("use_shm", False)
+        enable_gradient_checkpointing = self.config.model.get("enable_gradient_checkpointing", False)
+        trust_remote_code = self.config.model.get("trust_remote_code", False)
+        use_liger = self.config.model.get("use_liger", False)
+        enable_activation_offload = self.config.model.get("enable_activation_offload", False)
+
+        local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+
+        # tokenizer / processor
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        if self.config.model.get("custom_chat_template", None) is not None:
+            if self.processor is not None:
+                self.processor.chat_template = self.config.model.custom_chat_template
+            else:
+                self.tokenizer.chat_template = self.config.model.custom_chat_template
+
+        torch_dtype = fsdp_config.get("model_dtype", None)
+        if torch_dtype is None:
+            torch_dtype = torch.float32  # 建模阶段使用 fp32
+        else:
+            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
+        )
+        if self.ulysses_sequence_parallel_size > 1 and hasattr(actor_model_config, "vision_config"):
+            actor_model_config.vision_config._attn_implementation = "eager"
+        if getattr(actor_model_config, "model_type", None) == "kimi_vl":
+            actor_model_config.text_config.topk_method = "greedy"
+
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_model_config)
+        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            print(f"Model config after override: {actor_model_config}")
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
+        )
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
+                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+            )
+            if has_remote_code:
+                auto_class = next(
+                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
+                )
+                match auto_class:
+                    case "AutoModelForVision2Seq":
+                        actor_module_class = AutoModelForVision2Seq
+                    case "AutoModelForCausalLM":
+                        actor_module_class = AutoModelForCausalLM
+                    case "AutoModelForImageTextToText":
+                        actor_module_class = AutoModelForImageTextToText
+                    case _:
+                        actor_module_class = AutoModel
+            else:
+                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                    actor_module_class = AutoModelForVision2Seq
+                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
+                    actor_module_class = AutoModelForCausalLM
+                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                    actor_module_class = AutoModelForImageTextToText
+                else:
+                    actor_module_class = AutoModel
+
+            actor_module = actor_module_class.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=actor_model_config,
+                trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
+            )
+
+            if use_liger:
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                _apply_liger_kernel_to_instance(model=actor_module)
+
+            fused_kernel_options = self.config.model.get("fused_kernel_options", None)
+            fused_kernels_backend = (
+                fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+            )
+            apply_monkey_patch(
+                model=actor_module,
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_fused_kernels=use_fused_kernels,
+                fused_kernels_backend=fused_kernels_backend,
+            )
+            actor_module.to(torch_dtype)
+            if enable_gradient_checkpointing:
+                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        # 标记是否使用 LoRA
+        judge_cfg = self._get_judge_actor_model_cfg()
+        actor1_rank = getattr(judge_cfg, "lora_rank", None) if not isinstance(judge_cfg, dict) else judge_cfg.get("lora_rank")
+        actor2_rank = self.config.model.get("lora_rank", None)
+        self._is_lora = (actor1_rank and actor1_rank > 0) and (actor2_rank and actor2_rank > 0)
+
+        # 创建 Dual-LoRA 适配器
+        assert self._is_lora, "Dual-LoRA Actor requires both actor1 and actor2 to have LoRA adapters."
+        print("Applying LoRA to actor module")
+        actor_module.enable_input_require_grads()
+
+        def _get_val(cfg, key, default=None):
+            try:
+                if isinstance(cfg, dict):
+                    return cfg.get(key, default)
+                return getattr(cfg, key, default)
+            except Exception:
+                return default
+
+        judge_actor_model_cfg = self._get_judge_actor_model_cfg()
+        actor1_lora_rank = _get_val(judge_actor_model_cfg, "lora_rank", _get_val(self.config.model, "lora_rank", 0))
+        actor1_lora_alpha = _get_val(judge_actor_model_cfg, "lora_alpha", _get_val(self.config.model, "lora_alpha", 16))
+        actor1_lora_dropout = _get_val(judge_actor_model_cfg, "lora_dropout", _get_val(self.config.model, "lora_dropout", 0.0))
+        actor1_target_modules = _get_val(judge_actor_model_cfg, "lora_target_modules", _get_val(self.config.model, "lora_target_modules", None))
+        actor1_init_lora_weights = _get_val(judge_actor_model_cfg, "init_lora_weights", _get_val(self.config.model, "init_lora_weights", True))
+
+        actor2_lora_rank = _get_val(self.config.model, "lora_rank", 0)
+        actor2_lora_alpha = _get_val(self.config.model, "lora_alpha", 16)
+        actor2_lora_dropout = _get_val(self.config.model, "lora_dropout", 0.0)
+        actor2_target_modules = _get_val(self.config.model, "lora_target_modules", None)
+        actor2_init_lora_weights = _get_val(self.config.model, "init_lora_weights", True)
+
+        from peft import LoraConfig, TaskType
+
+        assert actor1_lora_rank > 0
+        lcfg1 = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=actor1_lora_rank,
+            lora_alpha=actor1_lora_alpha,
+            lora_dropout=actor1_lora_dropout,
+            target_modules=actor1_target_modules,
+            init_lora_weights=actor1_init_lora_weights,
+        )
+        peft_model = get_peft_model(
+            actor_module,
+            LoraConfig=lcfg1,
+            adapter_name="actor1"
+        )
+            
+        assert actor2_lora_rank > 0
+        lcfg2 = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=actor2_lora_rank,
+            lora_alpha=actor2_lora_alpha,
+            lora_dropout=actor2_lora_dropout,
+            target_modules=actor2_target_modules,
+            init_lora_weights=actor2_init_lora_weights,
+        )
+        peft_model.add_adapter("actor2", lcfg2)
+
+        # 加载 adapter 权重
+        actor1_path = None
+        try:
+            actor1_path = (
+                judge_actor_model_cfg.get("lora_adapter_path")
+                if isinstance(judge_actor_model_cfg, dict)
+                else getattr(judge_actor_model_cfg, "lora_adapter_path", None)
+            )
+        except Exception:
+            actor1_path = self.config.model.get("lora_adapter_path")
+        actor2_path = self.config.model.get("lora_adapter_path")
+        if actor1_path:
+            local_adapter_path = copy_to_local(actor1_path, use_shm=self.config.model.get("use_shm", False))
+            peft_model.load_adapter(local_adapter_path, adapter_name="actor1")
+        if actor2_path:
+            local_adapter_path = copy_to_local(actor2_path, use_shm=self.config.model.get("use_shm", False))
+            peft_model.load_adapter(local_adapter_path, adapter_name="actor2")
+
+        try:
+            peft_model.set_adapter("actor1")
+        except Exception:
+            pass
+        
+        actor_module = peft_model
+        self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if self.config.actor.get("freeze_vision_tower", False):
+            vision_tower = get_vl_model_vision_tower(actor_module)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                self.use_orig_params = True
+                if self.rank == 0:
+                    print("[actor model] Vision tower is set to not trainable.")
+            else:
+                if self.rank == 0:
+                    print("[actor model] No vision tower found.")
+
+        torch.distributed.barrier()
+        if self.rank == 0:
+            print_model_size(actor_module)
+        log_gpu_memory_usage("After init actor from HF AutoModel (dual)", logger=logger)
+
+
+        # FSDP 包裹
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = PrecisionType.to_dtype(fsdp_config.dtype)
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=actor_module,
+            config=fsdp_config.get("wrap_policy", None),
+            is_lora=self._is_lora,
+        )
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        cpu_offload = None  # actor 不使用 CPUOffload
+        fsdp_strategy = self.config.actor.strategy
+        if fsdp_strategy == "fsdp":
+            actor_module_fsdp = FSDP(
+                actor_module,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                use_orig_params=self.use_orig_params,
+                forward_prefetch=fsdp_config.get("forward_prefetch", False),
+            )
+        elif fsdp_strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "PyTorch >=2.4 required for FSDP2"
+            mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": None,
+                "reshard_after_forward": fsdp_config.reshard_after_forward,
+                "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
+            }
+            full_state = actor_module.state_dict()
+            apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, None)
+            actor_module_fsdp = actor_module
+        else:
+            raise NotImplementedError(f"Unknown fsdp strategy {fsdp_strategy}")
+        if enable_activation_offload:
+            enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
+        log_gpu_memory_usage("After actor FSDP init (dual)", logger=logger)
+
+        # 基础优化器（可选：仍然构建，但训练时只使用 adapter optimizers）
+        if optim_config is not None:
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+            base_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            total_steps = optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if lr_scheduler_type == "constant":
+                base_lr_scheduler = get_constant_schedule_with_warmup(base_optimizer, num_warmup_steps=num_warmup_steps)
+            elif lr_scheduler_type == "cosine":
+                base_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=base_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                base_lr_scheduler = None
+        else:
+            base_optimizer = None
+            base_lr_scheduler = None
+
+        self.actor_module_fsdp = actor_module_fsdp
+        self.actor_optimizer = base_optimizer
+        self.actor_lr_scheduler = base_lr_scheduler
+        self.actor_model_config = actor_model_config
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+
+        # 拆分优化器与调度器
+        actor1_params = list(self._iter_adapter_params("actor1"))
+        actor2_params = list(self._iter_adapter_params("actor2"))
+        actor1_optim_config = getattr(self.config.judge.actor, "optim", optim_config)
+        actor2_optim_config = optim_config
+        if actor1_optim_config is not None:
+            self.actor1_optimizer = build_optimizer(actor1_params, actor1_optim_config)
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
+            total_steps = actor1_optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(actor1_optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = actor1_optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = actor1_optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = actor1_optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = actor1_optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if lr_scheduler_type == "constant":
+                self.actor1_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=self.actor1_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                self.actor1_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=self.actor1_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                self.actor1_lr_scheduler = None
+        else:
+            self.actor1_optimizer = None
+            self.actor1_lr_scheduler = None
+        
+        if actor2_optim_config is not None:
+            self.actor2_optimizer = build_optimizer(actor2_params, actor2_optim_config)
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
+            total_steps = actor2_optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(actor2_optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = actor2_optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = actor2_optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = actor2_optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = actor2_optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if lr_scheduler_type == "constant":
+                self.actor2_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=self.actor2_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                self.actor2_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=self.actor2_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                self.actor2_lr_scheduler = None
+        else:
+            self.actor2_optimizer = None
+            self.actor2_lr_scheduler = None
+
+
+    def _iter_adapter_params(self, adapter_name: str):
+        # Only return parameters belonging to given adapter
+        for n, p in self.actor_module_fsdp.named_parameters():
+            if f"{adapter_name}" in n and p.requires_grad:
+                yield p
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # 与 ActorRolloutRefWorker.init_model 保持一致：外部库 -> 模型/优化器 -> Actor -> Rollout
+        from verl.workers.actor import DataParallelPPOActor
+
+        import_external_libs(self.config.model.get("external_lib", None))
+        self._build_dual_lora_actor()
+
+        # Offload（与原类一致）
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during init (dual)", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during init (dual)", logger=logger)
+
+        # DataParallelPPOActor（与原类一致）
+        actor_cfg = omega_conf_to_dataclass(self.config.actor)
+        # DataParallelPPOActor 仍然只有一个，训练时根据 active_adapter 切换对应优化器
+        self.actor = DataParallelPPOActor(
+            config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+        )
+
+        # 构建 rollout（直接复用 ActorRolloutRefWorker 实现）
+        ActorRolloutRefWorker._build_rollout(
+            self, trust_remote_code=self.config.model.get("trust_remote_code", False)
+        )
+
+        # 计数器与检查点管理（与原类一致）
+        self.flops_counter = FlopsCounter(self.actor_model_config)
+        # 默认以 actor1 的优化器与调度器做记录；保存/加载时会处理 LoRA 权重
+        default_optimizer = getattr(self, "actor1_optimizer", self.actor_optimizer)
+        default_lr_scheduler = getattr(self, "actor1_lr_scheduler", self.actor_lr_scheduler)
+        self.checkpoint_manager = FSDPCheckpointManager(
+            model=self.actor_module_fsdp,
+            optimizer=default_optimizer,
+            lr_scheduler=default_lr_scheduler,
+            processing_class=self.processor if self.processor is not None else self.tokenizer,
+            checkpoint_config=self.config.actor.checkpoint,
+        )
+
+    # ------------- Actor interfaces -------------
+    def _switch_adapter(self, name: str):
+        self.current_adapter = name
+        try:
+            self.actor_module_fsdp.set_adapter(name)
+        except Exception:
+            pass
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="rollout_generate")
+    def generate_sequences(self, prompts: DataProto):
+        # 完全复用 ActorRolloutRefWorker.generate_sequences 逻辑，并加入适配器切换
+        assert self.rollout is not None
+        prompts = prompts.to(get_device_id())
+
+        # 根据 meta 指示切换适配器（可选）
+        active_adapter = prompts.meta_info.get("active_adapter", self.current_adapter)
+        self._switch_adapter(active_adapter)
+
+        # 依据当前适配器选择采样/长度等覆盖参数（actor1 -> judge.rollout）
+        eff_rollout = self._get_effective_rollout_cfg(active_adapter)
+        # 始终写入必要的标志位（供引擎内部逻辑如 do_sample/validate 使用）
+        prompts.meta_info.update(
+            {
+                "eos_token_id": self.generation_config.eos_token_id
+                if getattr(self, "generation_config", None) is not None
+                else self.tokenizer.eos_token_id,
+                "pad_token_id": self.generation_config.pad_token_id
+                if getattr(self, "generation_config", None) is not None
+                else self.tokenizer.pad_token_id,
+                "do_sample": (
+                    getattr(eff_rollout, "do_sample", True)
+                    if not isinstance(eff_rollout, dict)
+                    else eff_rollout.get("do_sample", True)
+                ),
+            }
+        )
+
+        # 对支持的引擎（如 vLLM）优先使用 update_sampling_params 进行临时覆盖
+        sampling_overrides = {
+            "temperature": (
+                getattr(eff_rollout, "temperature", None)
+                if not isinstance(eff_rollout, dict)
+                else eff_rollout.get("temperature")
+            ),
+            "top_p": (
+                getattr(eff_rollout, "top_p", None)
+                if not isinstance(eff_rollout, dict)
+                else eff_rollout.get("top_p")
+            ),
+            "top_k": (
+                getattr(eff_rollout, "top_k", None)
+                if not isinstance(eff_rollout, dict)
+                else eff_rollout.get("top_k")
+            ),
+            # vLLM 的字段名为 max_tokens
+            "max_tokens": (
+                getattr(eff_rollout, "response_length", None)
+                if not isinstance(eff_rollout, dict)
+                else eff_rollout.get("response_length")
+            ),
+        }
+        # 清理掉 None 值，避免覆盖默认设置
+        sampling_overrides = {k: v for k, v in sampling_overrides.items() if v is not None}
+
+        timing_generate = {}
+        # 与原类相同：Actor 情况下切换 rollout 上下文
+        loop = get_event_loop()
+        loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
+        log_gpu_memory_usage("After switch to rollout mode (dual)", logger=logger)
+
+        with simple_timer("generate_sequences", timing_generate):
+            if hasattr(self.rollout, "update_sampling_params") and callable(
+                getattr(self.rollout, "update_sampling_params")
+            ) and sampling_overrides:
+                # 仅在支持的 rollout 上使用上下文管理覆盖采样参数
+                with self.rollout.update_sampling_params(**sampling_overrides):
+                    output = self.rollout.generate_sequences(prompts=prompts)
+            else:
+                # 回退：依赖引擎内部使用 meta_info 的实现（如 HF 实现）
+                # 注：vLLM 不会读取 meta_info 中的 top_p/temperature，这里只作为兜底
+                prompts.meta_info.update(
+                    {
+                        "temperature": sampling_overrides.get("temperature", 1.0),
+                        "top_p": sampling_overrides.get("top_p", 1.0),
+                        "top_k": sampling_overrides.get("top_k", -1),
+                        "response_length": sampling_overrides.get(
+                            "max_tokens", self.config.rollout.response_length
+                        ),
+                    }
+                )
+                output = self.rollout.generate_sequences(prompts=prompts)
+
+        loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
+        log_gpu_memory_usage("After switch to trainer mode (dual)", logger=logger)
+
+        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+            timing_generate["generate_sequences"]
+        )
+        timing_generate = reduce_timing(timing_generate)
+        timing_generate.update(
+            {
+                "generation_timing/max": timing_generate_max,
+                "generation_timing/min": timing_generate_min,
+                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+            }
+        )
+        output.meta_info["timing"] = timing_generate
+        output = output.to("cpu")
+        get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        # 与 ActorRolloutRefWorker.update_actor 一致，加入适配器选择
+        assert hasattr(self, "actor")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            # 根据适配器选择对应优化器进行加载
+            active_adapter_tmp = data.meta_info.get("active_adapter", self.current_adapter)
+            opt_to_load = self.actor1_optimizer if active_adapter_tmp == "actor1" else self.actor2_optimizer
+            load_fsdp_optimizer(optimizer=opt_to_load, device_id=get_device_id())
+
+        # 选择适配器与优化器
+        active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
+        self._switch_adapter(active_adapter)
+        # 切换 actor 内部使用的优化器为当前适配器对应的一套
+        self.actor.actor_optimizer = self.actor1_optimizer if active_adapter == "actor1" else self.actor2_optimizer
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            # 选择对应调度器 step
+            lr_scheduler = self.actor1_lr_scheduler if active_adapter == "actor1" else self.actor2_lr_scheduler
+            lr = lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor (dual)", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor (dual)", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+    def compute_log_prob(self, data: DataProto):
+        # 完全复用 ActorRolloutRefWorker.compute_log_prob，加入适配器切换
+        assert hasattr(self, "actor")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from contextlib import nullcontext
+
+        # 适配器选择
+        active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
+        self._switch_adapter(active_adapter)
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        eff_rollout = self._get_effective_rollout_cfg(active_adapter)
+        # 读取 log_prob 相关配置（若 judge.rollout 未定义则回退到顶层 rollout）
+        log_mb = getattr(eff_rollout, "log_prob_micro_batch_size_per_gpu", None)
+        if log_mb is None:
+            log_mb = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = log_mb
+
+        max_tok = getattr(eff_rollout, "log_prob_max_token_len_per_gpu", None)
+        if max_tok is None:
+            max_tok = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["max_token_len"] = max_tok
+
+        use_dyn = getattr(eff_rollout, "log_prob_use_dynamic_bsz", None)
+        if use_dyn is None:
+            use_dyn = self.config.rollout.log_prob_use_dynamic_bsz
+        data.meta_info["use_dynamic_bsz"] = use_dyn
+
+        temp_val = getattr(eff_rollout, "temperature", None)
+        if temp_val is None:
+            temp_val = self.config.rollout.temperature
+        data.meta_info["temperature"] = temp_val
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(
+                tensors={"old_log_probs": output, "entropys": entropys},
+                meta_info={"temperature": temp_val},
+            )
+
+        output = output.to("cpu")
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_log_prob (dual)", logger=logger)
+        return output
+
+    # ------------- RewardModel interfaces (actor1 as judge) -------------
+    def _build_judge_inputs(self, data: DataProto) -> list[str]:
+        tokenizer = self.tokenizer
+        batch_size = data.batch.batch_size[0]
+        attention_mask = data.batch["attention_mask"]
+        input_ids = data.batch.get("input_ids")
+        responses = data.batch.get("responses")
+        prompts = data.batch.get("prompts")
+        judge_texts = []
+        for i in range(batch_size):
+            if prompts is not None and responses is not None:
+                prompt_ids = prompts[i]
+                response_ids = responses[i]
+                prompt_len_total = prompt_ids.shape[-1]
+                valid_prompt_len = attention_mask[i][:prompt_len_total].sum()
+                valid_response_len = attention_mask[i][prompt_len_total:].sum()
+                prompt_str = tokenizer.decode(prompt_ids[-valid_prompt_len:], skip_special_tokens=True)
+                response_str = tokenizer.decode(response_ids[:valid_response_len], skip_special_tokens=True)
+            else:
+                ids = input_ids[i]
+                response_window_len = responses[i].shape[-1]
+                prompt_window_len = ids.shape[-1] - response_window_len
+                valid_prompt_len = attention_mask[i][:prompt_window_len].sum()
+                valid_response_len = attention_mask[i][-response_window_len:].sum()
+                prompt_segment = ids[:prompt_window_len]
+                response_segment = ids[-response_window_len:]
+                prompt_ids_valid = prompt_segment[-valid_prompt_len:]
+                response_ids_valid = response_segment[:valid_response_len]
+                prompt_str = tokenizer.decode(prompt_ids_valid, skip_special_tokens=True)
+                response_str = tokenizer.decode(response_ids_valid, skip_special_tokens=True)
+            judge_prompt = self.judge_template.format(prompt=prompt_str, response=response_str)
+            judge_texts.append(judge_prompt)
+        return judge_texts
+
+    def _forward_micro_batch_judge(self, judge_texts: list[str]) -> torch.Tensor:
+        # 优先使用 rollout 引擎（vLLM/SGLang等）进行加速；若不可用再退回 HF generate
+        self._switch_adapter("actor1")
+        gen_texts = []
+        if hasattr(self, "rollout") and self.rollout is not None:
+            # 构造 DataProto，复用 generate_sequences 的推理通路
+            eff_rollout = self._get_effective_rollout_cfg("actor1")
+            prompts_dp = DataProto.from_dict(
+                tensors={},
+                non_tensor_batch={"raw_prompt": judge_texts},
+                meta_info={
+                    "active_adapter": "actor1",
+                    "eos_token_id": self.generation_config.eos_token_id
+                        if getattr(self, "generation_config", None) is not None
+                        else self.tokenizer.eos_token_id,
+                    "pad_token_id": self.generation_config.pad_token_id
+                        if getattr(self, "generation_config", None) is not None
+                        else self.tokenizer.pad_token_id,
+                    "do_sample": getattr(eff_rollout, "do_sample", True)
+                        if not isinstance(eff_rollout, dict) else eff_rollout.get("do_sample", True),
+                    },
+            ).to(get_device_id())
+
+            # 切换到 rollout 模式生成
+            loop = get_event_loop()
+            loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
+            try:
+                # 对支持的引擎（如 vLLM）使用采样覆盖；否则回退到 meta_info 注入
+                sampling_overrides = {
+                    "temperature": (
+                        getattr(eff_rollout, "temperature", None)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("temperature")
+                    ),
+                    "top_p": (
+                        getattr(eff_rollout, "top_p", None)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("top_p")
+                    ),
+                    "top_k": (
+                        getattr(eff_rollout, "top_k", None)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("top_k")
+                    ),
+                    "max_tokens": (
+                        getattr(eff_rollout, "response_length", None)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("response_length")
+                    ),
+                }
+                sampling_overrides = {k: v for k, v in sampling_overrides.items() if v is not None}
+
+                if hasattr(self.rollout, "update_sampling_params") and callable(
+                    getattr(self.rollout, "update_sampling_params")
+                ) and sampling_overrides:
+                    with self.rollout.update_sampling_params(**sampling_overrides):
+                        output = self.rollout.generate_sequences(prompts=prompts_dp)
+                else:
+                    # 回退：补齐旧的 meta_info 字段以求最大兼容
+                    prompts_dp.meta_info.update(
+                        {
+                            "temperature": sampling_overrides.get("temperature", 1.0),
+                            "top_p": sampling_overrides.get("top_p", 1.0),
+                            "top_k": sampling_overrides.get("top_k", -1),
+                            "response_length": sampling_overrides.get(
+                                "max_tokens", self.config.rollout.response_length
+                            ),
+                        }
+                    )
+                    output = self.rollout.generate_sequences(prompts=prompts_dp)
+            finally:
+                loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
+
+            # output.non_tensor_batch 或 tensors 中应含生成文本/ids，兼容常见实现
+            if hasattr(output, "non_tensor_batch") and "responses_text" in output.non_tensor_batch:
+                gen_texts = list(output.non_tensor_batch["responses_text"])  # list[str]
+            elif hasattr(output, "tensors") and "responses" in output.tensors:
+                # 从 token ids 解码
+                resp_ids = output.tensors["responses"].to(get_device_id())
+                for i in range(resp_ids.shape[0]):
+                    gen_texts.append(self.tokenizer.decode(resp_ids[i], skip_special_tokens=True))
+            else:
+                # 兜底：无法解析 rollout 输出，回退到 HF
+                gen_texts = []
+
+        if len(gen_texts) == 0:
+            # 回退到 HF generate
+            eff_rollout = self._get_effective_rollout_cfg("actor1")
+            max_len = getattr(eff_rollout, "max_model_len", 4096)
+            enc = self.tokenizer(
+                judge_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_len,
+            )
+            input_ids = enc["input_ids"].to(get_device_id())
+            attention_mask = enc["attention_mask"].to(get_device_id())
+            with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                gen_out = self.actor_module_fsdp.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=(
+                        getattr(eff_rollout, "response_length", self.config.rollout.response_length)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("response_length", self.config.rollout.response_length)
+                    ),
+                    do_sample=(
+                        (getattr(eff_rollout, "temperature", 1.0) if not isinstance(eff_rollout, dict) else eff_rollout.get("temperature", 1.0))
+                        > 0
+                    ),
+                    temperature=(
+                        getattr(eff_rollout, "temperature", 1.0)
+                        if not isinstance(eff_rollout, dict)
+                        else eff_rollout.get("temperature", 1.0)
+                    ),
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            for i in range(gen_out.shape[0]):
+                orig_len = (attention_mask[i] == 1).sum().item()
+                new_tokens = gen_out[i][orig_len:]
+                text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+                gen_texts.append(text)
+        scores = []
+        for txt in gen_texts:
+            m = self.score_pattern.search(txt)
+            if m:
+                val = float(m.group(1))
+            else:
+                val = 0.0
+            val = max(self.score_min, min(self.score_max, val))
+            if self.normalize_score and self.score_max > self.score_min:
+                val = (val - self.score_min) / (self.score_max - self.score_min)
+            scores.append(val)
+        return torch.tensor(scores, dtype=torch.float32, device=get_device_id())
+
+    def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor) -> torch.Tensor:
+        attention_mask = data.batch["attention_mask"]
+        position_ids = data.batch["position_ids"]
+        response_length = data.batch["responses"].shape[-1]
+        if position_ids.dim() == 3:
+            position_ids = position_ids[:, 0, :]
+        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
+        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
+        token_level_scores[torch.arange(scores.size(0)), eos_mask_idx] = scores
+        token_level_scores = token_level_scores[:, -response_length:]
+        return token_level_scores
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @DistProfiler.annotate(color="orange")
+    def compute_rm_score(self, data: DataProto):
+        # Build judge prompts, use actor1 to generate judgement, parse score
+        data = data.to(get_device_id())
+        judge_texts = self._build_judge_inputs(data)
+        micro_bsz = self.config.get("micro_batch_size_per_gpu", len(judge_texts))
+        outputs = []
+        for start in range(0, len(judge_texts), micro_bsz):
+            mb_texts = judge_texts[start : start + micro_bsz]
+            mb_scores = self._forward_micro_batch_judge(mb_texts)
+            outputs.append(mb_scores)
+        scores = torch.cat(outputs, dim=0)
+        token_level_scores = self._expand_to_token_level(data, scores)
+        output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+        # Unshard
+        if self.device_mesh.size() > 1 and fsdp_version(self.actor_module_fsdp) == 1:
+            try:
+                self.actor_module_fsdp._handle.reshard(True)
+            except Exception:
+                pass
+        output = output.to("cpu")
+        return output
+
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
@@ -1959,3 +3228,41 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     ) -> list[int]:
         ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
         return ret
+
+# this class is not used currently, but implemented for future extension.
+# should never be called in current version.
+class AsyncActorRewardDualLoraWorker(ActorRewardDualLoraWorker):
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def wake_up(self):
+        await self.rollout_mode()
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def sleep(self):
+        await self.trainer_mode()
+        return True
+
+    # ============================ vLLM related ============================
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_zeromq_address(self):
+        return self.rollout.get_zeromq_address()
+
+    # ============================ SGLang related ============================
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def chat_completion(self, json_request):
+        ret = await self.rollout.chat_completion(json_request)
+        return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> list[int]:
+        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        return ret
+
