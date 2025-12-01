@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, List, Union
 
 from omegaconf import MISSING
 from transformers import AutoConfig
@@ -77,9 +77,10 @@ class HFModelConfig(BaseConfig):
     # lora related. We may setup a separate config later
     lora_rank: int = 0
     lora_alpha: int = 16
-    target_modules: Optional[str] = "all-linear"
-
-    exclude_modules: Optional[str] = None
+    #target_modules: Optional[Union[str, List[str]]] = "all-linear"
+    #exclude_modules: Optional[Union[str, List[str]]] = None
+    target_modules: Optional[Any] = "all-linear"
+    exclude_modules: Optional[Any] = None
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None

@@ -23,7 +23,7 @@ import logging
 import os
 import warnings
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any, Optional, List
 
 import numpy as np
 import psutil
@@ -32,7 +32,7 @@ import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -141,7 +141,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
 
     def __init__(self, config: DictConfig, role: str, **kwargs):
-        breakpoint()
+        #breakpoint()
         Worker.__init__(self)
 
         self.config = config
@@ -234,7 +234,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
 
-        breakpoint()
+        #breakpoint()
         # normalize config
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
@@ -2204,7 +2204,7 @@ class GenerativeRewardModelWorker(Worker, DistProfilerExtension):
 
 
 # ================= Dual-LoRA Actor + Generative RM Worker =================
-class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
+class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     """
     A composite worker that hosts one shared backbone model and two LoRA adapters
     (actor1, actor2). It exposes Actor-like methods for both actors by switching
@@ -2526,7 +2526,8 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         peft_model = get_peft_model(
             actor_module,
             peft_config=lcfg1,
-            adapter_name="actor1"
+            adapter_name="actor1",
+            mixed=True, # using PeftMixedModel to support multiple adapters loaded simultaneously
         )
             
         assert actor2_lora_rank > 0
@@ -2536,7 +2537,6 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             lora_alpha=actor2_lora_alpha,
             lora_dropout=actor2_lora_dropout,
             target_modules=actor2_target_modules,
-            exclude_modules=actor2_exclude_modules,
         )
         peft_model.add_adapter("actor2", lcfg2)
 
@@ -2558,11 +2558,9 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             local_adapter_path = copy_to_local(actor2_path, use_shm=self.config.model.get("use_shm", False))
             peft_model.load_adapter(local_adapter_path, adapter_name="actor2")
 
-        try:
-            peft_model.set_adapter("actor1")
-        except Exception:
-            pass
-        
+        # activate all adapters, so that FSDP handles them properly
+        peft_model.set_adapter(['actor1', "actor2"])
+
         actor_module = peft_model
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -2580,7 +2578,6 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print_model_size(actor_module)
         log_gpu_memory_usage("After init actor from HF AutoModel (dual)", logger=logger)
-
 
         # FSDP 包裹
         mixed_precision_config = fsdp_config.get("mixed_precision", None)
@@ -2672,9 +2669,10 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
         # 拆分优化器与调度器
+        
+        actor1_param_names, actor1_params = self._iter_adapter_params("actor1")
+        actor2_param_names, actor2_params = self._iter_adapter_params("actor2")
         breakpoint()
-        actor1_params = list(self._iter_adapter_params("actor1"))
-        actor2_params = list(self._iter_adapter_params("actor2"))
         actor1_optim_config = getattr(self._get_effective_cfg(adapter_name="actor1", cfg_name="actor"), "optim", optim_config)
         actor2_optim_config = optim_config
         if actor1_optim_config is not None:
@@ -2744,10 +2742,14 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
     def _iter_adapter_params(self, adapter_name: str):
         # Only return parameters belonging to given adapter
+        params = []
+        names = []
         with self._temp_switch_adapter(adapter_name):
             for n, p in self.actor_module_fsdp.named_parameters():
                 if f"{adapter_name}" in n and p.requires_grad:
-                    yield p
+                    params.append(p)
+                    names.append(n)
+        return names, params
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -2758,14 +2760,17 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         self._build_dual_lora_actor()
 
         # 如果上游配置提供了 active_adapter_name，初始化时切换到对应适配器
-        try:
-            active_hint = self.config.model.get("active_adapter_name", None)
-            if active_hint in ("actor1", "actor2"):
-                self._switch_adapter(active_hint)
-            elif active_hint is not None:
-                print(f"[DualLoRA] Invalid active_adapter_name='{active_hint}', fallback to '{self.current_adapter}'")
-        except Exception as e:
-            print(f"[DualLoRA] Failed to apply active_adapter_name hint: {e}")
+        # try:
+        #     active_hint = self.config.model.get("active_adapter_name", None)
+        #     if active_hint in ("actor1", "actor2"):
+        #         self._switch_adapter(active_hint)
+        #     elif active_hint is not None:
+        #         print(f"[DualLoRA] Invalid active_adapter_name='{active_hint}', fallback to '{self.current_adapter}'")
+        #     # note that this hint must be removed, because self.config.model will be converted into HFModelConfig later
+        #     breakpoint()
+        #     self.config.model.pop("active_adapter_name")
+        # except Exception as e:
+        #     print(f"[DualLoRA] Failed to apply active_adapter_name hint: {e}")
 
         # Offload（与原类一致）
         if self._is_offload_param:
@@ -2783,7 +2788,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         )
 
         # 构建 rollout（直接复用 ActorRolloutRefWorker 实现）
-        ActorRolloutRefWorker._build_rollout(
+        self._build_rollout(
             self, trust_remote_code=self.config.model.get("trust_remote_code", False)
         )
 
@@ -2801,7 +2806,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         )
 
     # ------------- Actor interfaces -------------
-    def _switch_adapter(self, name: str):
+    def _switch_adapter(self, name: str | List[str]):
         self.current_adapter = name
         try:
             self.actor_module_fsdp.set_adapter(name)
@@ -2809,7 +2814,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             raise ValueError(f"Failed to switch to adapter '{name}'")
     
     @contextmanager
-    def _temp_switch_adapter(self, name: str):
+    def _temp_switch_adapter(self, name: str | List[str]):
         """Context manager to switch adapter temporarily."""
         previous_adapter = self.current_adapter
         self._switch_adapter(name)
@@ -2817,6 +2822,180 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             yield
         finally:
             self._switch_adapter(previous_adapter)
+
+    def _build_rollout(self, trust_remote_code=False):
+        from torch.distributed.device_mesh import init_device_mesh
+
+        # 1. parse rollout and huggingface model config
+        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        self.model_config = model_config
+
+        # 2. build rollout device mesh
+        infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+        infer_pp = self.config.rollout.pipeline_model_parallel_size
+        infer_world_size = infer_tp * infer_pp
+        dp = self.world_size // infer_world_size
+        assert self.world_size % infer_world_size == 0, (
+            f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
+        )
+        rollout_device_mesh = init_device_mesh(
+            device_name, mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
+        )
+        rollout_name = self.config.rollout.name
+
+        if rollout_name == "hf":
+            self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
+        else:
+            is_collect = (
+                rollout_device_mesh["infer_tp"].get_local_rank() == 0
+                and rollout_device_mesh["infer_pp"].get_local_rank() == 0
+            )
+            self._register_dispatch_collect_info(
+                "rollout", dp_rank=rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+            )
+
+        # 3. init trainer and rollout random states
+        self.torch_random_states = get_torch_device().get_rng_state()
+        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
+        get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
+        # 4. build rollout model
+        log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
+        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+        )
+        log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
+
+        # Full params
+        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp,
+                state_dict_type=StateDictType.FULL_STATE_DICT,
+                state_dict_config=FullStateDictConfig(),
+            )
+        elif fsdp_version(self.actor_module_fsdp) == 1:
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+
+        # used for LoRA
+        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+        self.layered_summon = self.config.rollout.get("layered_summon", False)
+
+        # 5. switch to trainer mode
+        # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
+        # For sync mode, we directly switch to trainer mode here.
+        # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
+        if rollout_config.mode == "sync" and self._is_actor:
+            loop = get_event_loop()
+            loop.run_until_complete(self.trainer_mode())
+
+    async def rollout_mode(self):
+        """Context switch hybridengine to rollout mode."""
+        aggressive_empty_cache(force_sync=True)
+
+        log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+
+        peft_config = None
+        peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        if hasattr(peft_model, "peft_config"):  # LoRA
+            peft_config = peft_model.peft_config.get("default", None)
+            params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+                base_sync_done=self.base_sync_done,
+            )
+            if not self.base_sync_done:
+                params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+        else:
+            params = self.actor_module_fsdp.state_dict()
+
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+
+        # Special handling for LoRA with sleep_level=2:
+        # When sleep_level=2, base model weights are destroyed during each sleep cycle.
+        # separately collect and update LoRA weights and base model weights through their respective interfaces.
+        # Here: params contains LoRA weights, base_model_params contains base model weights.
+        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+            base_model_params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.layered_summon,
+                base_sync_done=False,
+            )
+            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+            base_model_params = convert_weight_keys(
+                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+
+        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+
+        set_expandable_segments(False)
+
+        if peft_config is not None and self.base_sync_done:
+            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+        else:
+            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+            per_tensor_param = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in params.items()
+            )
+
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["weights"])
+        log_gpu_memory_usage("After resume weights", logger=logger)
+
+        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+            per_tensor_base_params = (
+                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                for name, param in base_model_params.items()
+            )
+            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+            del base_model_params, per_tensor_base_params
+
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        log_gpu_memory_usage("After update_weights", logger=logger)
+        del params, per_tensor_param
+        aggressive_empty_cache(force_sync=True)
+        if self.config.rollout.free_cache_engine:
+            await self.rollout.resume(tags=["kv_cache"])
+        log_gpu_memory_usage("After resume kv_cache", logger=logger)
+
+        self.base_sync_done = True
+        # important: need to manually set the random states of each tp to be identical.
+        self.torch_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.gen_random_states)
+
+    async def trainer_mode(self):
+        """Context switch hybridengine to trainer mode."""
+        if self.config.rollout.free_cache_engine:
+            log_gpu_memory_usage("Before rollout offload", logger=logger)
+            await self.rollout.release()
+            log_gpu_memory_usage("After rollout offload", logger=logger)
+
+        self.actor_module_fsdp.train()
+
+        # add empty cache after each compute
+        aggressive_empty_cache(force_sync=True)
+
+        set_expandable_segments(True)
+
+        # restore random states
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -2878,7 +3057,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         timing_generate = {}
         # 与原类相同：Actor 情况下切换 rollout 上下文
         loop = get_event_loop()
-        loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
+        loop.run_until_complete(self.rollout_mode(self))
         log_gpu_memory_usage("After switch to rollout mode (dual)", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
@@ -2903,7 +3082,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
                 )
                 output = self.rollout.generate_sequences(prompts=prompts)
 
-        loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
+        loop.run_until_complete(self.trainer_mode(self))
         log_gpu_memory_usage("After switch to trainer mode (dual)", logger=logger)
 
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
@@ -3085,7 +3264,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
             # 切换到 rollout 模式生成
             loop = get_event_loop()
-            loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
+            loop.run_until_complete(self.rollout_mode(self))
             try:
                 # 对支持的引擎（如 vLLM）使用采样覆盖；否则回退到 meta_info 注入
                 sampling_overrides = {
@@ -3131,7 +3310,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
                     )
                     output = self.rollout.generate_sequences(prompts=prompts_dp)
             finally:
-                loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
+                loop.run_until_complete(self.trainer_mode(self))
 
             # output.non_tensor_batch 或 tensors 中应含生成文本/ids，兼容常见实现
             if hasattr(output, "non_tensor_batch") and "responses_text" in output.non_tensor_batch:

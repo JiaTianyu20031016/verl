@@ -674,7 +674,7 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        breakpoint()
+        #breakpoint()
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -1395,15 +1395,15 @@ class RayDualPPOTrainer:
         # Soft hint for worker: default active adapter for actor/rollout is "actor2".
         # This does not change training flow; if worker honors this key it will
         # start with adapter2 as the active actor.
-        try:
-            OmegaConf.set_struct(self.config, False)
-            with open_dict(self.config):
-                if OmegaConf.select(self.config, "actor_rollout_ref.model") is not None:
-                    self.config.actor_rollout_ref.model["active_adapter_name"] = self.config.actor_rollout_ref.model.get(
-                        "active_adapter_name", "actor2"
-                    )
-        except Exception as e:
-            print(f"Warning: failed to set active_adapter_name hint: {e}")
+        # try:
+        #     OmegaConf.set_struct(self.config, False)
+        #     with open_dict(self.config):
+        #         if OmegaConf.select(self.config, "actor_rollout_ref.model") is not None:
+        #             self.config.actor_rollout_ref.model["active_adapter_name"] = self.config.actor_rollout_ref.model.get(
+        #                 "active_adapter_name", "actor2"
+        #             )
+        # except Exception as e:
+        #     print(f"Warning: failed to set active_adapter_name hint: {e}")
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
