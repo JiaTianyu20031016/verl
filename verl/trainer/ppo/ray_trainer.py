@@ -1387,11 +1387,23 @@ class RayDualPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
         )
 
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = (
-            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
+        # In Dual-LoRA, we want the reference policy to be served by the same
+        # ActorRewardDualLoraWorker. Force ref_in_actor to True so trainer will
+        # call ref APIs on the actor worker rather than a separate one.
+        self.ref_in_actor = True
+
+        # Soft hint for worker: default active adapter for actor/rollout is "actor2".
+        # This does not change training flow; if worker honors this key it will
+        # start with adapter2 as the active actor.
+        try:
+            OmegaConf.set_struct(self.config, False)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.model") is not None:
+                    self.config.actor_rollout_ref.model["active_adapter_name"] = self.config.actor_rollout_ref.model.get(
+                        "active_adapter_name", "actor2"
+                    )
+        except Exception as e:
+            print(f"Warning: failed to set active_adapter_name hint: {e}")
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -1731,7 +1743,6 @@ class RayDualPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        breakpoint()
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -1742,7 +1753,6 @@ class RayDualPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role=str(Role.ActorRollout),
             )
             self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
         else:
@@ -1755,13 +1765,14 @@ class RayDualPPOTrainer:
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
-        # create reference policy if needed
-        if self.use_reference_policy:
+        # create reference policy if needed.
+        # rayPPOTrainer always create a separate ref policy worker group.
+        # however, when using LoRA (ref_in_actor=True), the ref policy will never be extracted from all_wg
+        if self.use_reference_policy and not self.ref_in_actor:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
                 config=self.config.actor_rollout_ref,
-                role=str(Role.RefPolicy),
             )
             self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
 

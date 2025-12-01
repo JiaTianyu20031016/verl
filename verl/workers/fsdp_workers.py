@@ -37,6 +37,7 @@ from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+from contextlib import contextmanager
 
 try:
     # for torch 2.5+
@@ -140,6 +141,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
 
     def __init__(self, config: DictConfig, role: str, **kwargs):
+        breakpoint()
         Worker.__init__(self)
 
         self.config = config
@@ -232,6 +234,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
 
+        breakpoint()
         # normalize config
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
@@ -2217,20 +2220,10 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
     def __init__(self, config: DictConfig):
         # 与 ActorRolloutRefWorker 保持一致的初始化框架
+
+        #breakpoint()
         Worker.__init__(self)
         self.config = config
-
-        omega_profiler_config = config.actor.get("profiler", {})
-        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
-            tool_config = omega_conf_to_dataclass(
-                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
-            )
-        else:
-            tool_config = None
-        DistProfilerExtension.__init__(
-            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
-        )
 
         import torch.distributed
         if not torch.distributed.is_initialized():
@@ -2278,6 +2271,18 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
         self._is_offload_optimizer = self.config.actor.fsdp_config.get("optimizer_offload", False)
 
+        omega_profiler_config = config.actor.get("profiler", {})
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+        )
+
         # 归一化 batch 配置（与 ActorRolloutRefWorker 同步）
         self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
         self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
@@ -2289,7 +2294,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
             assert (
                 self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
-            ), "normalized ppo_mini_batch_size should be divisible by ppo_micro_batch_size_per_gpu"
+            ), f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
 
         # rollout log_prob 归一化（需要用于 compute_log_prob 逻辑）
         if self.config.rollout.log_prob_micro_batch_size is not None:
@@ -2323,23 +2328,36 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         self.current_adapter = "actor1"
 
     # ---------- Minimal helpers for judge-aware config picking ----------
-    def _get_effective_rollout_cfg(self, adapter_name: str):
-        """Return rollout config; use judge.rollout if adapter is actor1 and available."""
-        # try:
-        #     if adapter_name == "actor1" and hasattr(self.config, "judge") and hasattr(self.config.judge, "rollout"):
-        #         return self.config.judge.rollout
-        # except Exception:
-        #     pass
-        return self.config.rollout
+    # def _get_effective_rollout_cfg(self, adapter_name: str):
+    #     """Return rollout config; use judge.rollout if adapter is actor1 and available."""
+    #     try:
+    #         if adapter_name == "actor1" and hasattr(self.config, "judge") and hasattr(self.config.judge, "rollout"):
+    #             return self.config.judge.rollout
+    #     except Exception:
+    #         pass
+    #     return self.config.rollout
 
-    def _get_judge_actor_model_cfg(self):
-        """Return judge.model config if available, else fallback to top-level model config."""
-        # try:
-        #     if hasattr(self.config, "judge") and hasattr(self.config.judge, "model"):
-        #         return self.config.judge.model
-        # except Exception:
-        #     pass
-        return self.config.model
+    # def _get_judge_actor_model_cfg(self):
+    #     """Return judge.model config if available, else fallback to top-level model config."""
+    #     try:
+    #         if hasattr(self.config, "judge") and hasattr(self.config.judge, "model"):
+    #             return self.config.judge.model
+    #     except Exception:
+    #         pass
+    #     return self.config.model
+
+    def _get_effective_cfg(self, adapter_name: str, cfg_name: str):
+        """Return rollout config; use judge.rollout if adapter is actor1 and available."""
+        if adapter_name == "actor2":
+            return self.config.get(cfg_name, None)
+        elif adapter_name == "actor1":
+            if hasattr(self.config, "judge") and hasattr(self.config.judge, cfg_name):
+                return getattr(self.config.judge, cfg_name)
+            else:
+                return self.config.get(cfg_name, None)
+        else:
+            raise ValueError(f"Unknown adapter name {adapter_name}")
+
 
     def _build_dual_lora_actor(self):
         """直接内联原 _build_model_optimizer 逻辑，并创建两套 LoRA 适配器与优化器。"""
@@ -2463,7 +2481,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         # 标记是否使用 LoRA
-        judge_cfg = self._get_judge_actor_model_cfg()
+        judge_cfg = self._get_effective_cfg(adapter_name="actor1", cfg_name="model")
         actor1_rank = getattr(judge_cfg, "lora_rank", None) if not isinstance(judge_cfg, dict) else judge_cfg.get("lora_rank")
         actor2_rank = self.config.model.get("lora_rank", None)
         self._is_lora = (actor1_rank and actor1_rank > 0) and (actor2_rank and actor2_rank > 0)
@@ -2481,18 +2499,18 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             except Exception:
                 return default
 
-        judge_actor_model_cfg = self._get_judge_actor_model_cfg()
-        actor1_lora_rank = _get_val(judge_actor_model_cfg, "lora_rank", _get_val(self.config.model, "lora_rank", 0))
-        actor1_lora_alpha = _get_val(judge_actor_model_cfg, "lora_alpha", _get_val(self.config.model, "lora_alpha", 16))
-        actor1_lora_dropout = _get_val(judge_actor_model_cfg, "lora_dropout", _get_val(self.config.model, "lora_dropout", 0.0))
-        actor1_target_modules = _get_val(judge_actor_model_cfg, "lora_target_modules", _get_val(self.config.model, "lora_target_modules", None))
-        actor1_init_lora_weights = _get_val(judge_actor_model_cfg, "init_lora_weights", _get_val(self.config.model, "init_lora_weights", True))
+        judge_actor_model_cfg = self._get_effective_cfg(adapter_name="actor1", cfg_name="model")
+        actor1_lora_rank = _get_val(judge_actor_model_cfg, "lora_rank", 0)
+        actor1_lora_alpha = _get_val(judge_actor_model_cfg, "lora_alpha", 16)
+        actor1_lora_dropout = _get_val(judge_actor_model_cfg, "lora_dropout", 0.0)
+        actor1_target_modules = _get_val(judge_actor_model_cfg, "target_modules", None)
+        actor1_exclude_modules = _get_val(judge_actor_model_cfg, "exclude_modules", None)
 
         actor2_lora_rank = _get_val(self.config.model, "lora_rank", 0)
         actor2_lora_alpha = _get_val(self.config.model, "lora_alpha", 16)
         actor2_lora_dropout = _get_val(self.config.model, "lora_dropout", 0.0)
-        actor2_target_modules = _get_val(self.config.model, "lora_target_modules", None)
-        actor2_init_lora_weights = _get_val(self.config.model, "init_lora_weights", True)
+        actor2_target_modules = _get_val(self.config.model, "target_modules", None)
+        actor2_exclude_modules = _get_val(self.config.model, "exclude_modules", None)
 
         from peft import LoraConfig, TaskType
 
@@ -2503,11 +2521,11 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             lora_alpha=actor1_lora_alpha,
             lora_dropout=actor1_lora_dropout,
             target_modules=actor1_target_modules,
-            init_lora_weights=actor1_init_lora_weights,
+            exclude_modules=actor1_exclude_modules,
         )
         peft_model = get_peft_model(
             actor_module,
-            LoraConfig=lcfg1,
+            peft_config=lcfg1,
             adapter_name="actor1"
         )
             
@@ -2518,7 +2536,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             lora_alpha=actor2_lora_alpha,
             lora_dropout=actor2_lora_dropout,
             target_modules=actor2_target_modules,
-            init_lora_weights=actor2_init_lora_weights,
+            exclude_modules=actor2_exclude_modules,
         )
         peft_model.add_adapter("actor2", lcfg2)
 
@@ -2654,9 +2672,10 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
         # 拆分优化器与调度器
+        breakpoint()
         actor1_params = list(self._iter_adapter_params("actor1"))
         actor2_params = list(self._iter_adapter_params("actor2"))
-        actor1_optim_config = getattr(self.config.judge.actor, "optim", optim_config)
+        actor1_optim_config = getattr(self._get_effective_cfg(adapter_name="actor1", cfg_name="actor"), "optim", optim_config)
         actor2_optim_config = optim_config
         if actor1_optim_config is not None:
             self.actor1_optimizer = build_optimizer(actor1_params, actor1_optim_config)
@@ -2725,9 +2744,10 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
     def _iter_adapter_params(self, adapter_name: str):
         # Only return parameters belonging to given adapter
-        for n, p in self.actor_module_fsdp.named_parameters():
-            if f"{adapter_name}" in n and p.requires_grad:
-                yield p
+        with self._temp_switch_adapter(adapter_name):
+            for n, p in self.actor_module_fsdp.named_parameters():
+                if f"{adapter_name}" in n and p.requires_grad:
+                    yield p
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -2736,6 +2756,16 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
         import_external_libs(self.config.model.get("external_lib", None))
         self._build_dual_lora_actor()
+
+        # 如果上游配置提供了 active_adapter_name，初始化时切换到对应适配器
+        try:
+            active_hint = self.config.model.get("active_adapter_name", None)
+            if active_hint in ("actor1", "actor2"):
+                self._switch_adapter(active_hint)
+            elif active_hint is not None:
+                print(f"[DualLoRA] Invalid active_adapter_name='{active_hint}', fallback to '{self.current_adapter}'")
+        except Exception as e:
+            print(f"[DualLoRA] Failed to apply active_adapter_name hint: {e}")
 
         # Offload（与原类一致）
         if self._is_offload_param:
@@ -2776,7 +2806,17 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         try:
             self.actor_module_fsdp.set_adapter(name)
         except Exception:
-            pass
+            raise ValueError(f"Failed to switch to adapter '{name}'")
+    
+    @contextmanager
+    def _temp_switch_adapter(self, name: str):
+        """Context manager to switch adapter temporarily."""
+        previous_adapter = self.current_adapter
+        self._switch_adapter(name)
+        try:
+            yield
+        finally:
+            self._switch_adapter(previous_adapter)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -2790,7 +2830,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         self._switch_adapter(active_adapter)
 
         # 依据当前适配器选择采样/长度等覆盖参数（actor1 -> judge.rollout）
-        eff_rollout = self._get_effective_rollout_cfg(active_adapter)
+        eff_rollout = self._get_effective_cfg(active_adapter, "rollout")
         # 始终写入必要的标志位（供引擎内部逻辑如 do_sample/validate 使用）
         prompts.meta_info.update(
             {
@@ -2949,7 +2989,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-        eff_rollout = self._get_effective_rollout_cfg(active_adapter)
+        eff_rollout = self._get_effective_cfg(active_adapter, "rollout")
         # 读取 log_prob 相关配置（若 judge.rollout 未定义则回退到顶层 rollout）
         log_mb = getattr(eff_rollout, "log_prob_micro_batch_size_per_gpu", None)
         if log_mb is None:
@@ -3026,7 +3066,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
         gen_texts = []
         if hasattr(self, "rollout") and self.rollout is not None:
             # 构造 DataProto，复用 generate_sequences 的推理通路
-            eff_rollout = self._get_effective_rollout_cfg("actor1")
+            eff_rollout = self._get_effective_cfg("actor1", "rollout")
             prompts_dp = DataProto.from_dict(
                 tensors={},
                 non_tensor_batch={"raw_prompt": judge_texts},
@@ -3107,7 +3147,7 @@ class ActorRewardDualLoraWorker(Worker, DistProfilerExtension):
 
         if len(gen_texts) == 0:
             # 回退到 HF generate
-            eff_rollout = self._get_effective_rollout_cfg("actor1")
+            eff_rollout = self._get_effective_cfg("actor1", "rollout")
             max_len = getattr(eff_rollout, "max_model_len", 4096)
             enc = self.tokenizer(
                 judge_texts,

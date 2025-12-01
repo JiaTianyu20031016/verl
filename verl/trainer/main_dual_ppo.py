@@ -253,65 +253,6 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # ================= Judge 配置继承与覆盖 =================
-        # 需求：字段级“只填空不覆盖”逻辑：
-        # 如果 judge.actor 或 judge.rollout 中某个字段：
-        #   - 缺失 key；或值为 None；或为 MISSING("???")；则使用 base 中对应字段值
-        # 否则保持用户显式设置值不变。
-        # 对嵌套 Dict 递归处理；List 直接沿用 judge 的显式值（若为空或 None 且 base 有值则用 base）。
-        MISSING = '???'
-
-        def _fill_inherit(base_cfg, judge_cfg):
-            """返回一个新的 DictConfig：在 judge_cfg 上只填补未显式设置的字段。
-
-            判定“未显式设置”的条件：
-              1) key 不存在于 judge_cfg
-              2) judge_cfg[key] 为 None
-              3) judge_cfg[key] 为 MISSING ('???')
-            若值是字典型 (DictConfig) 且两边都有，递归填充其子字段。
-            List 不做细粒度继承（仅在 judge 缺失或 None 时整体拷贝 base）。
-            """
-            if base_cfg is None:
-                return judge_cfg  # nothing to inherit
-            if judge_cfg is None:
-                return OmegaConf.clone(base_cfg)
-
-            # 复制一份，避免直接修改传入对象（后面会再赋回 config.judge.*）
-            merged = OmegaConf.clone(judge_cfg)
-            for k, v in base_cfg.items():
-                if not hasattr(merged, k):  # OmegaConf might use attribute access
-                    pass  # continue to logic below using key access
-                # 获取 judge 当前值，可能不存在
-                j_has = k in merged
-                j_val = merged.get(k) if j_has else None
-                need_fill = (not j_has) or (j_val is None) or (j_val == MISSING)
-                if need_fill:
-                    with open_dict(merged):
-                        merged[k] = OmegaConf.clone(v)
-                else:
-                    # 递归：双方都是 DictConfig
-                    from omegaconf import DictConfig, ListConfig
-                    if isinstance(v, DictConfig) and isinstance(j_val, DictConfig):
-                        with open_dict(merged):
-                            merged[k] = _fill_inherit(v, j_val)
-                    # List 不递归；只有在前面 need_fill 时才整体复制
-            return merged
-
-        with open_dict(config):
-            if 'judge' not in config:
-                config.judge = OmegaConf.create({})
-            # 处理 actor 子配置
-            base_actor_cfg = config.actor
-            judge_actor_cfg = config.judge.get('actor', None)
-            if base_actor_cfg is not None:
-                config.judge.actor = _fill_inherit(base_actor_cfg, judge_actor_cfg)
-            # 处理 rollout 子配置
-            base_rollout_cfg = config.rollout
-            judge_rollout_cfg = config.judge.get('rollout', None)
-            if base_rollout_cfg is not None:
-                config.judge.rollout = _fill_inherit(base_rollout_cfg, judge_rollout_cfg)
-        # ======================================================
-
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
