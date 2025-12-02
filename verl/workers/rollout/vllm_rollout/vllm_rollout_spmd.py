@@ -129,6 +129,8 @@ class vLLMRollout(BaseRollout):
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        max_loras: int = None,
+        max_lora_rank: int = None,
     ):
         super().__init__(config, model_config, device_mesh)
 
@@ -149,7 +151,7 @@ class vLLMRollout(BaseRollout):
             lora_rank = model_config.lora_rank
 
         self.lora_kwargs = (
-            {"enable_lora": True, "max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(lora_rank)}
+            {"enable_lora": True, "max_loras": 1 if max_loras is None else max_loras, "max_lora_rank": get_vllm_max_lora_rank(lora_rank) if max_lora_rank is None else max_lora_rank}
             if model_config.lora_rank > 0
             else {}
         )
@@ -526,13 +528,15 @@ class vLLMAsyncRollout(BaseRollout):
         config: RolloutConfig,
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
+        max_loras: int = None,
+        max_lora_rank: int = None,
     ):
         super().__init__(config, model_config, device_mesh)
         self.tokenizer = self.model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
         self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
+            {"max_loras": 1 if max_loras is None else max_loras, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank) if max_lora_rank is None else max_lora_rank}
             if self.model_config.lora_rank > 0
             else {}
         )

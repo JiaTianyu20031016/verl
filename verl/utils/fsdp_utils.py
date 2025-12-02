@@ -566,7 +566,7 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     return total_norm
 
 
-def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+def layered_summon_lora_params(fsdp_module, adapter_name: str="default") -> OrderedDict:
     from peft.utils.save_and_load import get_peft_model_state_dict
 
     def __prefix_submodules(module, prefix):
@@ -595,7 +595,7 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
                 continue
             if fsdp_version(submodule) > 0:
                 with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
+                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name)
                     sub_lora_params = {
                         f"{prefix}.{name}": param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
@@ -608,7 +608,7 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
     return lora_params
 
 
-def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool) -> OrderedDict:
+def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool, adapter_name: str="default") -> OrderedDict:
     """
     collect lora params or full params if base model is not ready in vllm
     work with if isinstance(self.module._fsdp_wrapped_module, PeftModel)
@@ -624,11 +624,11 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
                     "To use layered_summon, you must make sure base-model is preloaded in vllm, e.g. let "
                     "rollout.load_format=safetensors"
                 )
-            lora_params = layered_summon_lora_params(module)
+            lora_params = layered_summon_lora_params(module, adapter_name=adapter_name)
         else:
             with FSDP.summon_full_params(module, writeback=False):
                 if base_sync_done:
-                    lora_params = get_peft_model_state_dict(peft_model)
+                    lora_params = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)
                     lora_params = {
                         name: param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
@@ -652,7 +652,7 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
             get_torch_device().empty_cache()
     else:
         if base_sync_done:
-            lora_params = get_peft_model_state_dict(peft_model)
+            lora_params = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)
         else:
             model = peft_model.base_model.model
             orig_dev = "cpu" if "cpu" in str(next(model.parameters()).device) else get_device_name()
@@ -692,3 +692,214 @@ def replace_lora_wrapper(k, peft_config):
         elif any([module_k.endswith(s) for s in stacked_params]) or check_target_modules(peft_config, module_k):
             return f"{module_k}.base_layer.bias"
     return k
+
+
+def merge_lora_adapters(
+    lora_param_list: list[dict[str, torch.Tensor]], lora_config_list: list[object]
+) -> dict[str, torch.Tensor]:
+    """
+    Merge multiple LoRA adapters into a single set of LoRA parameters.
+    This function combines multiple LoRA adapters by concatenating their A and B matrices
+    along the rank dimension, and summing their biases if present.
+
+    Args:
+        lora_param_list (list[dict[str, torch.Tensor]]): List of LoRA parameter dictionaries to merge.
+        lora_config_list (list[object]): List of LoRA configuration objects corresponding to the parameter dictionaries.   
+    Returns:
+        dict[str, torch.Tensor]: Merged LoRA parameters.
+    """
+    def _parse_kind_and_prefix(key: str):
+        # Return (module_prefix, kind, is_embedding, is_bias)
+        # kind in {"A", "B"}; embedding uses lora_embedding_A/B format
+        if ".lora_A." in key:
+            return key.split(".lora_A.")[0], "A", False, False
+        if ".lora_B." in key:
+            return key.split(".lora_B.")[0], "B", False, False
+        if key.endswith("lora_embedding_A"):
+            return key[: -len(".lora_embedding_A")], "A", True, False
+        if key.endswith("lora_embedding_B"):
+            return key[: -len(".lora_embedding_B")], "B", True, False
+        if key.endswith(".bias"):
+            # e.g. base_model.model.xxx.lora_linear.bias
+            # keep module up to the lora layer name (drop last two parts)
+            parts = key.split(".")
+            return ".".join(parts[:-2]), None, False, True
+        return None, None, False, False
+
+
+    from peft import LoraConfig, TaskType
+
+    assert len(lora_param_list) == len(lora_config_list), "Length of lora_param_list and lora_config_list must be the same."
+    if len(lora_param_list) == 0:
+        return {}
+    if len(lora_param_list) == 1:
+        return lora_param_list[0]
+
+    # 1) 统计所有模块（prefix）的并集，以及每个模块是 embedding 还是 linear 命名
+    module_kinds: dict[str, dict] = {}
+    for params in lora_param_list:
+        for k in params.keys():
+            prefix, kind, is_emb, is_bias = _parse_kind_and_prefix(k)
+            if prefix is None:
+                continue
+            info = module_kinds.setdefault(prefix, {"is_emb": False, "has_bias": False})
+            info["is_emb"] = info["is_emb"] or is_emb
+            info["has_bias"] = info["has_bias"] or is_bias
+
+    # 2) 为每个模块分别合并 A/B，按秩方向 concat；缺位用全 0 填充
+    merged_params: dict[str, torch.Tensor] = {}
+
+    # 统一的缩放策略：将每个子 LoRA 的缩放 (alpha_i / r_i) 预乘到 B_i 上，
+    # 然后设置合并后的 peft_config 使 alpha_total = r_total（从而全局缩放为 1）。
+    r_list = []
+    alpha_list = []
+    for cfg in lora_config_list:
+        # peft LoraConfig 中，r 与 lora_alpha 为字段名
+        r_list.append(int(getattr(cfg, "r", getattr(cfg, "lora_r", 0))))
+        alpha_list.append(float(getattr(cfg, "lora_alpha", getattr(cfg, "alpha", 0.0))))
+    rank_total = int(sum(r_list)) if len(r_list) > 0 else 0
+
+    for module_prefix, meta in module_kinds.items():
+        # 先解析某个适配器中的形状，得到 in_dim 与 out_dim
+        A_shapes = []
+        B_shapes = []
+        A_tensors = []
+        B_tensors = []
+        bias_tensors = []
+
+        # 遍历每个适配器，取出该模块的 A/B，缺位则占位 None
+        for idx, params in enumerate(lora_param_list):
+            # 可能存在两种命名：linear(lora_A/B.weight) 或 embedding(lora_embedding_A/B)
+            if meta["is_emb"]:
+                kA = f"{module_prefix}.lora_embedding_A"
+                kB = f"{module_prefix}.lora_embedding_B"
+            else:
+                kA = f"{module_prefix}.lora_A.weight"
+                kB = f"{module_prefix}.lora_B.weight"
+
+            Ai = params.get(kA, None)
+            Bi = params.get(kB, None)
+
+            # 尝试兼容带适配器名的键（例如 lora_A.default.weight）
+            if Ai is None:
+                for k in params.keys():
+                    if k.startswith(module_prefix) and ".lora_A." in k and k.endswith(".weight"):
+                        Ai = params[k]
+                        break
+            if Bi is None:
+                for k in params.keys():
+                    if k.startswith(module_prefix) and ".lora_B." in k and k.endswith(".weight"):
+                        Bi = params[k]
+                        break
+
+            # 记录 bias（如果有），按简单加和
+            bkey = None
+            for k in params.keys():
+                if k.startswith(module_prefix) and k.endswith(".bias"):
+                    bkey = k
+                    break
+            bias_tensors.append(params.get(bkey, None) if bkey else None)
+
+            A_tensors.append(Ai)
+            B_tensors.append(Bi)
+            if Ai is not None:
+                A_shapes.append(Ai.shape)
+            if Bi is not None:
+                B_shapes.append(Bi.shape)
+
+        # 推断 in_dim/out_dim
+        if len(A_shapes) == 0 and len(B_shapes) == 0:
+            # 没有任何 LoRA 权重，跳过
+            continue
+        # A: (r, in_dim)，B: (out_dim, r)
+        # 从已存在的形状中推断 in_dim/out_dim
+        in_dim = A_shapes[0][1] if len(A_shapes) > 0 else None
+        out_dim = B_shapes[0][0] if len(B_shapes) > 0 else None
+
+        # 构造按秩拼接的列表
+        scaled_As = []
+        scaled_Bs = []
+
+        for i, (Ai, Bi) in enumerate(zip(A_tensors, B_tensors)):
+            r_i = r_list[i] if i < len(r_list) else (Ai.shape[0] if Ai is not None else (Bi.shape[1] if Bi is not None else 0))
+            alpha_i = alpha_list[i] if i < len(alpha_list) else float(r_i)
+
+            # 缺位填 0
+            if Ai is None and in_dim is not None and r_i > 0:
+                Ai = torch.zeros((r_i, in_dim), dtype=B_shapes[0] if len(B_shapes)>0 else torch.float32).to(torch.float32)
+                Ai = Ai.to(next(iter(lora_param_list[0].values())).dtype)
+            if Bi is None and out_dim is not None and r_i > 0:
+                Bi = torch.zeros((out_dim, r_i), dtype=((A_shapes[0][0] if len(A_shapes)>0 else 0) or torch.float32)).to(torch.float32)
+                Bi = Bi.to(next(iter(lora_param_list[0].values())).dtype)
+
+            if Ai is None or Bi is None:
+                # 仍为空，说明也无法推断形状，跳过该适配器的该模块
+                continue
+
+            # dtype 对齐为第一个非空权重的 dtype
+            base_dtype = Ai.dtype
+            if Bi.dtype != base_dtype:
+                Bi = Bi.to(base_dtype)
+
+            # 预缩放 B：scale_i = (alpha_i / r_i)
+            scale_i = float(alpha_i) / float(max(r_i, 1))
+            Bi = Bi * scale_i
+
+            scaled_As.append(Ai)
+            scaled_Bs.append(Bi)
+
+        if len(scaled_As) == 0 or len(scaled_Bs) == 0:
+            continue
+
+        # 沿秩方向拼接：A 纵向（r 总在第 0 维），B 横向（r 在第 1 维）
+        A_cat = torch.cat(scaled_As, dim=0)
+        B_cat = torch.cat(scaled_Bs, dim=1)
+
+        if meta["is_emb"]:
+            merged_params[f"{module_prefix}.lora_embedding_A"] = A_cat
+            merged_params[f"{module_prefix}.lora_embedding_B"] = B_cat
+        else:
+            merged_params[f"{module_prefix}.lora_A.weight"] = A_cat
+            merged_params[f"{module_prefix}.lora_B.weight"] = B_cat
+
+        # bias 按加和
+        if meta.get("has_bias", False):
+            bs = [b for b in bias_tensors if b is not None]
+            if len(bs) > 0:
+                b_sum = bs[0]
+                for t in bs[1:]:
+                    if t.dtype != b_sum.dtype:
+                        t = t.to(b_sum.dtype)
+                    b_sum = b_sum + t
+                merged_params[f"{module_prefix}.lora_linear.bias"] = b_sum
+
+    # 3) 构造合并后的 peft_config：r_total，alpha_total=r_total（全局缩放为 1），target_modules 为并集
+    # 继承第一个配置的基础属性
+    base_cfg = lora_config_list[0]
+    # 收集 target_modules 并集
+    def _get_target_modules(cfg):
+        val = getattr(cfg, "target_modules", None)
+        if val is None:
+            return []
+        if isinstance(val, str):
+            return [val]
+        return list(val)
+
+    target_union = set()
+    for cfg in lora_config_list:
+        target_union.update(_get_target_modules(cfg))
+
+    # 检查 lora_config_list 中的lora dropout字段是否一致
+    lora_dropout_values = {getattr(cfg, "lora_dropout", 0.0) for cfg in lora_config_list}
+    if len(lora_dropout_values) > 1:
+        raise ValueError("Inconsistent lora_dropout values in lora_config_list")
+
+    peft_config = LoraConfig(
+        task_type=getattr(base_cfg, "task_type", TaskType.CAUSAL_LM),
+        r=max(rank_total, 0),
+        lora_alpha=max(rank_total, 0),  # 令全局缩放=1（已把 alpha_i/r_i 吸收到 B 中）
+        lora_dropout=getattr(base_cfg, "lora_dropout", 0.0),
+        target_modules=sorted(list(target_union)) if len(target_union) > 0 else None,
+    )
+    params = merged_params
+    return params, peft_config
