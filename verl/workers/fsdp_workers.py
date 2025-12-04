@@ -32,7 +32,7 @@ import torch.distributed
 import torch.distributed as dist
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
-from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
+from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -80,7 +80,6 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
     replace_lora_wrapper,
-    merge_lora_adapters
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -665,7 +664,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
-            breakpoint()
             params = collect_lora_params(
                 module=self.actor_module_fsdp,
                 layered_summon=self.config.rollout.get("layered_summon", False),
@@ -1111,7 +1109,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
-
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
@@ -2221,9 +2218,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     def __init__(self, config: DictConfig):
         # 与 ActorRolloutRefWorker 保持一致的初始化框架
-        self._is_actor=True
-        self._is_ref=True
-        self._is_rollout=True
 
         Worker.__init__(self)
         self.config = config
@@ -2330,6 +2324,24 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         # 当前适配器：actor1/actor2
         self.current_adapter = "actor1"
 
+    # ---------- Minimal helpers for judge-aware config picking ----------
+    # def _get_effective_rollout_cfg(self, adapter_name: str):
+    #     """Return rollout config; use judge.rollout if adapter is actor1 and available."""
+    #     try:
+    #         if adapter_name == "actor1" and hasattr(self.config, "judge") and hasattr(self.config.judge, "rollout"):
+    #             return self.config.judge.rollout
+    #     except Exception:
+    #         pass
+    #     return self.config.rollout
+
+    # def _get_judge_actor_model_cfg(self):
+    #     """Return judge.model config if available, else fallback to top-level model config."""
+    #     try:
+    #         if hasattr(self.config, "judge") and hasattr(self.config.judge, "model"):
+    #             return self.config.judge.model
+    #     except Exception:
+    #         pass
+    #     return self.config.model
 
     def _get_effective_cfg(self, adapter_name: str, cfg_name: str):
         """Return rollout config; use judge.rollout if adapter is actor1 and available."""
@@ -2484,93 +2496,68 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             except Exception:
                 return default
 
-        # judge_actor_model_cfg = self._get_effective_cfg(adapter_name="actor1", cfg_name="model")
-        # actor1_lora_rank = _get_val(judge_actor_model_cfg, "lora_rank", 0)
-        # actor1_lora_alpha = _get_val(judge_actor_model_cfg, "lora_alpha", 16)
-        # actor1_lora_dropout = _get_val(judge_actor_model_cfg, "lora_dropout", 0.0)
-        # actor1_target_modules = _get_val(judge_actor_model_cfg, "target_modules", None)
-        # actor1_exclude_modules = _get_val(judge_actor_model_cfg, "exclude_modules", None)
+        judge_actor_model_cfg = self._get_effective_cfg(adapter_name="actor1", cfg_name="model")
+        actor1_lora_rank = _get_val(judge_actor_model_cfg, "lora_rank", 0)
+        actor1_lora_alpha = _get_val(judge_actor_model_cfg, "lora_alpha", 16)
+        actor1_lora_dropout = _get_val(judge_actor_model_cfg, "lora_dropout", 0.0)
+        actor1_target_modules = _get_val(judge_actor_model_cfg, "target_modules", None)
+        actor1_exclude_modules = _get_val(judge_actor_model_cfg, "exclude_modules", None)
 
-        # actor2_lora_rank = _get_val(self.config.model, "lora_rank", 0)
-        # actor2_lora_alpha = _get_val(self.config.model, "lora_alpha", 16)
-        # actor2_lora_dropout = _get_val(self.config.model, "lora_dropout", 0.0)
-        # actor2_target_modules = _get_val(self.config.model, "target_modules", None)
-        # actor2_exclude_modules = _get_val(self.config.model, "exclude_modules", None)
+        actor2_lora_rank = _get_val(self.config.model, "lora_rank", 0)
+        actor2_lora_alpha = _get_val(self.config.model, "lora_alpha", 16)
+        actor2_lora_dropout = _get_val(self.config.model, "lora_dropout", 0.0)
+        actor2_target_modules = _get_val(self.config.model, "target_modules", None)
+        actor2_exclude_modules = _get_val(self.config.model, "exclude_modules", None)
 
-        # from peft import LoraConfig, TaskType
+        from peft import LoraConfig, TaskType
 
-        # assert actor1_lora_rank > 0
-        # lcfg1 = LoraConfig(
-        #     task_type=TaskType.CAUSAL_LM,
-        #     r=actor1_lora_rank,
-        #     lora_alpha=actor1_lora_alpha,
-        #     lora_dropout=actor1_lora_dropout,
-        #     target_modules=actor1_target_modules,
-        #     exclude_modules=actor1_exclude_modules,
-        # )
-        # peft_model = get_peft_model(
-        #     actor_module,
-        #     peft_config=lcfg1,
-        #     adapter_name="actor1",
-        #     mixed=True, # using PeftMixedModel to support multiple adapters loaded simultaneously
-        # )
-            
-        # assert actor2_lora_rank > 0
-        # lcfg2 = LoraConfig(
-        #     task_type=TaskType.CAUSAL_LM,
-        #     r=actor2_lora_rank,
-        #     lora_alpha=actor2_lora_alpha,
-        #     lora_dropout=actor2_lora_dropout,
-        #     target_modules=actor2_target_modules,
-        # )
-        # peft_model.add_adapter("actor2", lcfg2)
-
-        # # 加载 adapter 权重
-        # actor1_path = None
-        # try:
-        #     actor1_path = (
-        #         judge_actor_model_cfg.get("lora_adapter_path")
-        #         if isinstance(judge_actor_model_cfg, dict)
-        #         else getattr(judge_actor_model_cfg, "lora_adapter_path", None)
-        #     )
-        # except Exception:
-        #     actor1_path = self.config.model.get("lora_adapter_path")
-        # actor2_path = self.config.model.get("lora_adapter_path")
-        # if actor1_path:
-        #     local_adapter_path = copy_to_local(actor1_path, use_shm=self.config.model.get("use_shm", False))
-        #     peft_model.load_adapter(local_adapter_path, adapter_name="actor1")
-        # if actor2_path:
-        #     local_adapter_path = copy_to_local(actor2_path, use_shm=self.config.model.get("use_shm", False))
-        #     peft_model.load_adapter(local_adapter_path, adapter_name="actor2")
-
-        # 此处假设三个lora adapter配置完全相同，并且都初始化（不从外部加载）
-        # TODO: 可扩展为分别加载不同路径的 adapter，并且采用不同的lora参数
-        lora_rank = _get_val(self.config.model, "lora_rank", 0)
-        lora_alpha = _get_val(self.config.model, "lora_alpha", 16)
-        lora_dropout = _get_val(self.config.model, "lora_dropout", 0.0)
-        target_modules = _get_val(self.config.model, "target_modules", None)
-        exclude_modules = _get_val(self.config.model, "exclude_modules", None)
-        assert lora_rank > 0
-        lcfg = LoraConfig(
+        assert actor1_lora_rank > 0
+        lcfg1 = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=target_modules,
-            exclude_modules=exclude_modules,
+            r=actor1_lora_rank,
+            lora_alpha=actor1_lora_alpha,
+            lora_dropout=actor1_lora_dropout,
+            target_modules=actor1_target_modules,
+            exclude_modules=actor1_exclude_modules,
         )
         peft_model = get_peft_model(
             actor_module,
-            peft_config=lcfg,
-            adapter_name="shared",
+            peft_config=lcfg1,
+            adapter_name="actor1",
             mixed=True, # using PeftMixedModel to support multiple adapters loaded simultaneously
         )
-        peft_model.add_adapter("actor2", lcfg)
-        peft_model.add_adapter("actor1", lcfg)
+            
+        assert actor2_lora_rank > 0
+        lcfg2 = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=actor2_lora_rank,
+            lora_alpha=actor2_lora_alpha,
+            lora_dropout=actor2_lora_dropout,
+            target_modules=actor2_target_modules,
+        )
+        peft_model.add_adapter("actor2", lcfg2)
+
+        # 加载 adapter 权重
+        actor1_path = None
+        try:
+            actor1_path = (
+                judge_actor_model_cfg.get("lora_adapter_path")
+                if isinstance(judge_actor_model_cfg, dict)
+                else getattr(judge_actor_model_cfg, "lora_adapter_path", None)
+            )
+        except Exception:
+            actor1_path = self.config.model.get("lora_adapter_path")
+        actor2_path = self.config.model.get("lora_adapter_path")
+        if actor1_path:
+            local_adapter_path = copy_to_local(actor1_path, use_shm=self.config.model.get("use_shm", False))
+            peft_model.load_adapter(local_adapter_path, adapter_name="actor1")
+        if actor2_path:
+            local_adapter_path = copy_to_local(actor2_path, use_shm=self.config.model.get("use_shm", False))
+            peft_model.load_adapter(local_adapter_path, adapter_name="actor2")
 
         # activate all adapters, so that FSDP handles them properly
-        peft_model.set_adapter(["shared", 'actor1', "actor2"])
-
+        peft_model.set_adapter(['actor1', "actor2"])
+        
         actor_module = peft_model
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -2643,7 +2630,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
         log_gpu_memory_usage("After actor FSDP init (dual)", logger=logger)
 
-        # 该版本采用单优化器解决方案：三个适配器参数均加入同一优化器
+        # 基础优化器（可选：仍然构建，但训练时只使用 adapter optimizers）
         if optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
             base_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
@@ -2678,7 +2665,76 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         if fsdp_version(self.actor_module_fsdp) == 1:
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
+        # 拆分优化器与调度器
+        actor1_param_names, actor1_params = self._iter_adapter_params("actor1")
+        actor2_param_names, actor2_params = self._iter_adapter_params("actor2")
+        actor1_optim_config = getattr(self._get_effective_cfg(adapter_name="actor1", cfg_name="actor"), "optim", optim_config)
+        actor2_optim_config = optim_config
+        if actor1_optim_config is not None:
+            self.actor1_optimizer = build_optimizer(actor1_params, actor1_optim_config)
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
+            total_steps = actor1_optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(actor1_optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = actor1_optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = actor1_optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = actor1_optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = actor1_optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if lr_scheduler_type == "constant":
+                self.actor1_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=self.actor1_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                self.actor1_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=self.actor1_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                self.actor1_lr_scheduler = None
+        else:
+            self.actor1_optimizer = None
+            self.actor1_lr_scheduler = None
         
+        if actor2_optim_config is not None:
+            self.actor2_optimizer = build_optimizer(actor2_params, actor2_optim_config)
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
+            total_steps = actor2_optim_config.get("total_training_steps", 0)
+            num_warmup_steps = int(actor2_optim_config.get("lr_warmup_steps", -1))
+            lr_scheduler_type = actor2_optim_config.get("lr_scheduler_type", "constant")
+            min_lr_ratio = actor2_optim_config.get("min_lr_ratio", 0.0)
+            num_cycles = actor2_optim_config.get("num_cycles", 0.5)
+            if num_warmup_steps < 0:
+                num_warmup_steps_ratio = actor2_optim_config.get("lr_warmup_steps_ratio", 0.0)
+                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+            if lr_scheduler_type == "constant":
+                self.actor2_lr_scheduler = get_constant_schedule_with_warmup(
+                    optimizer=self.actor2_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "cosine":
+                self.actor2_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=self.actor2_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
+                    num_cycles=num_cycles,
+                )
+            else:
+                self.actor2_lr_scheduler = None
+        else:
+            self.actor2_optimizer = None
+            self.actor2_lr_scheduler = None
+
+
     def _iter_adapter_params(self, adapter_name: str):
         # Only return parameters belonging to given adapter
         params = []
@@ -2689,7 +2745,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
                     params.append(p)
                     names.append(n)
         return names, params
-
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -2707,7 +2762,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         #     elif active_hint is not None:
         #         print(f"[DualLoRA] Invalid active_adapter_name='{active_hint}', fallback to '{self.current_adapter}'")
         #     # note that this hint must be removed, because self.config.model will be converted into HFModelConfig later
-        #     breakpoint()
         #     self.config.model.pop("active_adapter_name")
         # except Exception as e:
         #     print(f"[DualLoRA] Failed to apply active_adapter_name hint: {e}")
@@ -2728,28 +2782,28 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         )
 
         # 构建 rollout（直接复用 ActorRolloutRefWorker 实现）
-        self._build_rollout(
-            trust_remote_code=self.config.model.get("trust_remote_code", False)
+        ActorRolloutRefWorker._build_rollout(
+            self, trust_remote_code=self.config.model.get("trust_remote_code", False)
         )
 
         # 计数器与检查点管理（与原类一致）
         self.flops_counter = FlopsCounter(self.actor_model_config)
+        # 默认以 actor1 的优化器与调度器做记录；保存/加载时会处理 LoRA 权重
+        default_optimizer = getattr(self, "actor1_optimizer", self.actor_optimizer)
+        default_lr_scheduler = getattr(self, "actor1_lr_scheduler", self.actor_lr_scheduler)
         self.checkpoint_manager = FSDPCheckpointManager(
             model=self.actor_module_fsdp,
-            optimizer=self.actor_optimizer,
-            lr_scheduler=self.actor_lr_scheduler,
+            optimizer=default_optimizer,
+            lr_scheduler=default_lr_scheduler,
             processing_class=self.processor if self.processor is not None else self.tokenizer,
             checkpoint_config=self.config.actor.checkpoint,
         )
 
     # ------------- Actor interfaces -------------
-    def _switch_adapter(self, name: str):
-        if name not in ("actor1", "actor2"):
-            raise ValueError(f"Unknown adapter name '{name}'")
+    def _switch_adapter(self, name: str | List[str]):
         self.current_adapter = name
-        # shared adapter is always activated
         try:
-            self.actor_module_fsdp.set_adapter([name, 'shared'])
+            self.actor_module_fsdp.set_adapter(name)
         except Exception:
             raise ValueError(f"Failed to switch to adapter '{name}'")
     
@@ -2805,11 +2859,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, 
-            model_config=model_config, 
-            device_mesh=rollout_device_mesh,
-            max_loras=2,
-            max_lora_rank=2*self.config.model.get("lora_rank", 0),
+            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
@@ -2851,29 +2901,17 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
+            peft_config = peft_model.peft_config.get("default", None)
+            params = collect_lora_params(
+                module=self.actor_module_fsdp,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+                base_sync_done=self.base_sync_done,
+            )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
-            else:
-                # there may be multiple lora adapters activated simultaneously.
-                # iteratively collect LoRA params from each active adapter
-                # and merge them as the final params to be sent to rollout engine.
-                lora_param_list = []
-                lora_config_list = []
-                for adapter_name in peft_model.active_adapters:
-                    peft_config = peft_model.peft_config.get(adapter_name, None)
-                    params = collect_lora_params(
-                        module=self.actor_module_fsdp,
-                        layered_summon=self.config.rollout.get("layered_summon", False),
-                        base_sync_done=self.base_sync_done,
-                        adapter_name=adapter_name,
-                    )
-                    lora_param_list.append(params)
-                    lora_config_list.append(peft_config)
-                # merge LoRA params from all active adapters
-                params, peft_config = merge_lora_adapters(lora_param_list, lora_config_list)
         else:
             params = self.actor_module_fsdp.state_dict()
-        
+
         params = convert_weight_keys(
             params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         )
@@ -3013,7 +3051,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         timing_generate = {}
         # 与原类相同：Actor 情况下切换 rollout 上下文
         loop = get_event_loop()
-        loop.run_until_complete(self.rollout_mode())
+        loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
         log_gpu_memory_usage("After switch to rollout mode (dual)", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
@@ -3038,7 +3076,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
                 )
                 output = self.rollout.generate_sequences(prompts=prompts)
 
-        loop.run_until_complete(self.trainer_mode())
+        loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
         log_gpu_memory_usage("After switch to trainer mode (dual)", logger=logger)
 
         timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
@@ -3055,6 +3093,57 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
         get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        # 与 ActorRolloutRefWorker.update_actor 一致，加入适配器选择
+        assert hasattr(self, "actor")
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            # 根据适配器选择对应优化器进行加载
+            active_adapter_tmp = data.meta_info.get("active_adapter", self.current_adapter)
+            opt_to_load = self.actor1_optimizer if active_adapter_tmp == "actor1" else self.actor2_optimizer
+            load_fsdp_optimizer(optimizer=opt_to_load, device_id=get_device_id())
+
+        # 选择适配器与优化器
+        active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
+        self._switch_adapter(active_adapter)
+        # 切换 actor 内部使用的优化器为当前适配器对应的一套
+        self.actor.actor_optimizer = self.actor1_optimizer if active_adapter == "actor1" else self.actor2_optimizer
+
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            with Timer(name="update_policy", logger=None) as timer:
+                metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            # 选择对应调度器 step
+            lr_scheduler = self.actor1_lr_scheduler if active_adapter == "actor1" else self.actor2_lr_scheduler
+            lr = lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            lr_scheduler.step()
+
+            output = DataProto(meta_info={"metrics": metrics})
+            output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor (dual)", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor (dual)", logger=logger)
+
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -3169,7 +3258,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
             # 切换到 rollout 模式生成
             loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            loop.run_until_complete(ActorRolloutRefWorker.rollout_mode(self))
             try:
                 # 对支持的引擎（如 vLLM）使用采样覆盖；否则回退到 meta_info 注入
                 sampling_overrides = {
@@ -3215,7 +3304,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
                     )
                     output = self.rollout.generate_sequences(prompts=prompts_dp)
             finally:
-                loop.run_until_complete(self.trainer_mode())
+                loop.run_until_complete(ActorRolloutRefWorker.trainer_mode(self))
 
             # output.non_tensor_batch 或 tensors 中应含生成文本/ids，兼容常见实现
             if hasattr(output, "non_tensor_batch") and "responses_text" in output.non_tensor_batch:
@@ -3296,24 +3385,55 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="orange")
     def compute_rm_score(self, data: DataProto):
-        # Build judge prompts, use actor1 to generate judgement, parse score
-        data = data.to(get_device_id())
-        judge_texts = self._build_judge_inputs(data)
-        micro_bsz = self.config.get("micro_batch_size_per_gpu", len(judge_texts))
-        outputs = []
-        for start in range(0, len(judge_texts), micro_bsz):
-            mb_texts = judge_texts[start : start + micro_bsz]
-            mb_scores = self._forward_micro_batch_judge(mb_texts)
-            outputs.append(mb_scores)
-        scores = torch.cat(outputs, dim=0)
+        # 从 data.batch['judge_response'] 解码并解析评分；失败样本标注 reward valid=False
+
+        breakpoint()
+        judge_resp = data.batch.get("judge_response", None)
+        if judge_resp is None:
+            # 无评判响应，直接返回零分并全部置为无效
+            bsz = data.batch["attention_mask"].shape[0]
+            scores = torch.zeros(bsz, dtype=torch.float32, device='cpu')
+            valids = np.zeros(bsz, dtype=bool)
+        else:
+            # 将响应统一为文本列表以便解析
+            judge_texts = []
+            for i in range(judge_resp.shape[0]):
+                judge_texts.append(self.tokenizer.decode(judge_resp[i].to('cpu'), skip_special_tokens=True))
+
+            # 解析评分与有效性
+            scores_list = []
+            valids_list = []
+            for txt in judge_texts:
+                m = self.score_pattern.search(txt)
+                if m:
+                    try:
+                        val = float(m.group(1))
+                        valid = True
+                    except Exception:
+                        val = 0.0
+                        valid = False
+                else:
+                    val = 0.0
+                    valid = False
+                val = max(self.score_min, min(self.score_max, val))
+                if self.normalize_score and self.score_max > self.score_min:
+                    val = (val - self.score_min) / (self.score_max - self.score_min)
+                scores_list.append(val)
+                valids_list.append(valid)
+
+            scores = torch.tensor(scores_list, dtype=torch.float32, device='cpu')
+            valids = np.asarray(valids_list, dtype=bool)
+
+        # 扩展为逐 token 奖励，仅在响应区间最后一个 token 处赋值
         token_level_scores = self._expand_to_token_level(data, scores)
-        output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
-        # Unshard
-        if self.device_mesh.size() > 1 and fsdp_version(self.actor_module_fsdp) == 1:
-            try:
-                self.actor_module_fsdp._handle.reshard(True)
-            except Exception:
-                pass
+
+        # 输出并附加有效性标志到 batch
+        output = DataProto.from_single_dict(
+            {
+                'rm_scores': token_level_scores,
+                'rm_valids': valids
+            }
+        )
         output = output.to("cpu")
         return output
 

@@ -259,6 +259,7 @@ def compute_advantage(
     return data
 
 
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -1836,12 +1837,7 @@ class RayDualPPOTrainer:
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from verl.experimental.agent_loop import AgentLoopManager
-
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
-            )
+            raise NotImplementedError("async rollout mode is not implemented for dual-PPO yet")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -2022,6 +2018,93 @@ class RayDualPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _build_judge_inputs(self, data: DataProto, src_tokenizer=None, dst_tokenizer=None, max_length=None) -> dict:
+        """Return tokenized judge inputs dict aligned with RLHFDataset.__getitem__.
+
+        Keys:
+          - input_ids: list[Tensor]
+          - attention_mask: list[Tensor]
+          - position_ids: list[Tensor]
+          - raw_prompt_ids: list[list[int]]
+        """
+        src_tokenizer = self.tokenizer if src_tokenizer is None else src_tokenizer
+        dst_tokenizer = self.tokenizer if dst_tokenizer is None else dst_tokenizer
+        batch_size = data.batch.batch_size[0]
+        attention_mask = data.batch["attention_mask"]
+        input_ids = data.batch.get("input_ids")
+        responses = data.batch.get("responses")
+        prompts = data.batch.get("prompts")
+        max_len = max_length if max_length is not None else prompts.shape[-1] + responses.shape[-1]
+
+        outputs = {
+            "input_ids": [],
+            "attention_mask": [],
+            "position_ids": [],
+            "raw_prompt_ids": [],
+        }
+
+        for i in range(batch_size):
+            if data.non_tensor_batch.get('raw_prompt', None) is not None:
+                # read prompt from non-tensor batch if available
+                assert data.non_tensor_batch['raw_prompt'][i][-1]['role'] == 'user'
+                prompt_str = data.non_tensor_batch['raw_prompt'][i][-1]['content']
+            elif prompts is not None:
+                # decode prompt only
+                prompt_ids = prompts[i]
+                prompt_len_total = prompt_ids.shape[-1]
+                valid_prompt_len = attention_mask[i][:prompt_len_total].sum()
+                prompt_str = src_tokenizer.decode(prompt_ids[-valid_prompt_len:], skip_special_tokens=True)
+            else:
+                # clip prompt from input_ids and decode
+                ids = input_ids[i]
+                response_window_len = responses[i].shape[-1]
+                prompt_window_len = ids.shape[-1] - response_window_len
+                valid_prompt_len = attention_mask[i][:prompt_window_len].sum()
+                prompt_segment = ids[:prompt_window_len]
+                prompt_ids_valid = prompt_segment[-valid_prompt_len:]
+                prompt_str = src_tokenizer.decode(prompt_ids_valid, skip_special_tokens=True)
+            
+            # decode response
+            response_window_len = responses[i].shape[-1]
+            valid_response_len = attention_mask[i][-response_window_len:].sum()
+            # note that responses are paddd on the right
+            response_ids_valid = responses[i][:valid_response_len]
+            response_str = src_tokenizer.decode(response_ids_valid, skip_special_tokens=True)
+            
+            # formulate judge prompt
+            judge_prompt = self.judge_template.format(prompt=prompt_str, response=response_str)
+            messages = [{"role": "user", "content": judge_prompt}]
+            judge_prompt = dst_tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+            )
+
+            # Tokenize
+            model_inputs = dst_tokenizer(judge_prompt, return_tensors="pt", add_special_tokens=False)
+            j_input_ids = model_inputs.pop("input_ids")
+            j_attention_mask = model_inputs.pop("attention_mask")
+
+            import verl.utils.torch_functional as verl_F
+            from verl.utils.model import compute_position_id_with_mask
+            # Postprocess (truncate/pad with left_pad=True like dataset)
+            j_input_ids, j_attention_mask = verl_F.postprocess_data(
+                input_ids=j_input_ids,
+                attention_mask=j_attention_mask,
+                max_length=max_len,
+                pad_token_id=dst_tokenizer.pad_token_id,
+                left_pad=True,      # use left padding
+                truncation='left'   # use left truncation
+            )
+
+            j_position_ids = compute_position_id_with_mask(j_attention_mask)
+            raw_prompt_ids = dst_tokenizer.encode(judge_prompt, add_special_tokens=False)
+
+            outputs["input_ids"].append(j_input_ids[0])
+            outputs["attention_mask"].append(j_attention_mask[0])
+            outputs["position_ids"].append(j_position_ids[0])
+            outputs["raw_prompt_ids"].append(raw_prompt_ids)
+
+        return outputs
+
     def fit(self):
         """
         The training loop of PPO.
@@ -2105,15 +2188,21 @@ class RayDualPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        # 1) Answer rollout with actor2
+                        # Hint to worker to use actor2 adapter during generation
+                        gen_batch_output.meta_info["active_adapter"] = "actor2"
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
+                            raise NotImplementedError("async rollout is not supported in dual-ppo trainer yet")
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        raise NotImplementedError("REMAX is not implemented in dual-ppo trainer yet")
+                        # REMAX advantage estimation
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -2123,6 +2212,7 @@ class RayDualPPOTrainer:
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
+                                raise NotImplementedError("async rollout is not supported in dual-ppo trainer yet")
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
@@ -2141,10 +2231,36 @@ class RayDualPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
+                    
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # 2) Build LLM-as-a-Judge prompts from (prompt, answer) pairs
+                    # Reuse the worker's default template if present in config, else fallback
+                    # judge_dict = self._build_judge_inputs(batch)
+                    judge_batch = self.actor_rollout_wg._build_judge_inputs(batch)
+
+                    # 3) Critique rollout with actor1 on judge prompts
+                    judge_batch.meta_info["global_steps"] = self.global_steps
+                    judge_batch.meta_info["active_adapter"] = "actor1"
+                    if not self.async_rollout_mode:  
+                        judge_batch = self.actor_rollout_wg.generate_sequences(judge_batch)
+                    else:
+                        raise NotImplementedError("async rollout is not supported in dual-ppo trainer yet")
+                    batch.batch['judge_responses'] = judge_batch.batch['responses']
+                    # Optionally record critique texts for debugging/analysis without changing training flow
+                    # critique_texts = []
+                    # if hasattr(judge_batch, "non_tensor_batch") and "responses_text" in judge_batch.non_tensor_batch:
+                    #     critique_texts = list(judge_batch.non_tensor_batch["responses_text"])  # list[str]
+                    # elif "responses" in judge_batch.batch:
+                    #     resp_ids = judge_batch.batch["responses"].to('cpu')
+                    #     for i in range(resp_ids.shape[0]):
+                    #         critique_texts.append(self.tokenizer.decode(resp_ids[i], skip_special_tokens=True))
+                    # # store but do not affect the rest of the training pipeline
+                    # judge_batch.non_tensor_batch["critique_texts"] = np.array(critique_texts, dtype=object)
+
+                    breakpoint()
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -2159,16 +2275,18 @@ class RayDualPPOTrainer:
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        # if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        #     reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        #     batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        # if self.config.reward_model.launch_reward_fn_async:
+                        #     future_reward = compute_reward_async.remote(
+                        #         data=batch, config=self.config, tokenizer=self.tokenizer
+                        #     )
+                        # else:
+                        #     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
