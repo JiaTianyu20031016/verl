@@ -2350,7 +2350,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     def _get_effective_cfg(self, adapter_name: str, cfg_name: str):
         """Return rollout config; use judge.rollout if adapter is actor1 and available."""
-        if adapter_name == "actor2":
+        if adapter_name in ['actor2', 'None', 'shared']:
             return self.config.get(cfg_name, None)
         elif adapter_name == "actor1":
             if hasattr(self.config, "judge") and hasattr(self.config.judge, cfg_name):
@@ -3077,6 +3077,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         # 完全复用 ActorRolloutRefWorker.compute_log_prob，加入适配器切换
+        # breakpoint()
         assert hasattr(self, "actor")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -3390,13 +3391,14 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="orange")
     def compute_rm_score(self, data: DataProto):
         # 从 data.batch['judge_response'] 解码并解析评分；失败样本标注 reward valid=False
-        breakpoint()
-        judge_resp = data.batch.get("judge_response", None)
+        judge_resp = data.batch.get("judge_responses", None)
+        
         if judge_resp is None:
             # 无评判响应，直接返回零分并全部置为无效
             bsz = data.batch["attention_mask"].shape[0]
             scores = torch.zeros(bsz, dtype=torch.float32, device='cpu')
             valids = np.zeros(bsz, dtype=bool)
+            judge_texts = np.asarray([""] * bsz)
         else:
             # 将响应统一为文本列表以便解析
             judge_texts = []
@@ -3426,6 +3428,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
             scores = torch.tensor(scores_list, dtype=torch.float32, device='cpu')
             valids = np.asarray(valids_list, dtype=bool)
+            judge_texts = np.asarray(judge_texts)
 
         # 扩展为逐 token 奖励，仅在响应区间最后一个 token 处赋值
         token_level_scores = self._expand_to_token_level(data, scores)

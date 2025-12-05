@@ -2260,7 +2260,6 @@ class RayDualPPOTrainer:
                     # # store but do not affect the rest of the training pipeline
                     # judge_batch.non_tensor_batch["critique_texts"] = np.array(critique_texts, dtype=object)
 
-                    breakpoint()
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -2287,6 +2286,7 @@ class RayDualPPOTrainer:
                         #     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
                         batch = batch.union(reward_tensor)
+                        reward_extra_infos_dict = None
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2377,6 +2377,7 @@ class RayDualPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        breakpoint()
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
