@@ -211,6 +211,7 @@ def compute_advantage(
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        print("Warning: haven't supported rm_valids in GAE yet.")
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
@@ -236,11 +237,13 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            rm_valids=data.non_tensor_batch.get("rm_valids", None),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
+        print("Warning: haven't supported rm_valids in other adv estimators yet.")
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
         adv_kwargs = {
             "token_level_rewards": data.batch["token_level_rewards"],
@@ -2340,13 +2343,13 @@ class RayDualPPOTrainer:
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        # reward_extra_infos_dict: dict[str, list]
+                        # if self.config.reward_model.launch_reward_fn_async:
+                        #     reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        # batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        # if reward_extra_infos_dict:
+                        #     batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -2377,7 +2380,6 @@ class RayDualPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        breakpoint()
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -2400,6 +2402,7 @@ class RayDualPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            batch.meta_info['active_adapter'] = 'actor2'  # always use actor2 adapter for actor update
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

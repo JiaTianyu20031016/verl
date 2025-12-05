@@ -880,7 +880,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
+                with self.switch_adapter(active_adapter):
+                    metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -3436,7 +3438,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         # 输出并附加有效性标志到 batch
         output = DataProto.from_single_dict(
             {
-                'rm_scores': token_level_scores,
+                'token_level_scores': token_level_scores,
                 'rm_valids': valids,
                 'raw_judge_texts': judge_texts,
             }

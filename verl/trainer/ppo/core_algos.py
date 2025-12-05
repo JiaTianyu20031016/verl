@@ -269,6 +269,7 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    rm_valids: Optional[torch.Tensor | np.ndarray] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -300,6 +301,15 @@ def compute_grpo_outcome_advantage(
     """
     scores = token_level_rewards.sum(dim=-1)
 
+    # rm_valids: bool mask, shape (bs,). True means valid reward entry.
+    # Invalid entries are excluded from group mean/std, and their advantages are zeroed out.
+    if rm_valids is None:
+        valid_mask = torch.ones_like(scores, dtype=torch.bool)
+    elif isinstance(rm_valids, np.ndarray):
+        valid_mask = torch.from_numpy(rm_valids).to(scores.device).bool()
+    else:
+        valid_mask = rm_valids.to(scores.device).bool()
+
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
@@ -307,11 +317,13 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
+            if not valid_mask[i]:
+                continue
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                id2mean[idx] = torch.tensor(0.0, device=scores.device)
+                id2std[idx] = torch.tensor(1.0, device=scores.device)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
@@ -319,10 +331,15 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
+            if not valid_mask[i]:
+                scores[i] = torch.tensor(0.0, device=scores.device)
+                continue
+            mean_val = id2mean.get(index[i], torch.tensor(0.0, device=scores.device))
+            std_val = id2std.get(index[i], torch.tensor(1.0, device=scores.device))
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                scores[i] = (scores[i] - mean_val) / (std_val + epsilon)
             else:
-                scores[i] = scores[i] - id2mean[index[i]]
+                scores[i] = scores[i] - mean_val
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
