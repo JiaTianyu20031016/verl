@@ -892,9 +892,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
-                with self.switch_adapter(active_adapter):
-                    metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -3442,76 +3440,50 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
 
-    # use ActorRefRollout.load_checkpoint instead
-    # @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    # def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-    #     """Load base FSDP checkpoint and all LoRA adapters for Dual-LoRA actor."""
-    #     assert self._is_actor or (not self._is_actor and self._is_rollout), (
-    #         f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
-    #         f"{self._is_actor} and {self._is_rollout}"
-    #     )
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="actor_update")
+    def update_actor(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
-    #     # No checkpoint to load: just offload
-    #     if local_path is None:
-    #         if self._is_offload_param:
-    #             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-    #         if self._is_offload_optimizer:
-    #             offload_fsdp_optimizer(self.actor_optimizer)
-    #         return
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
-    #     if self._is_offload_param:
-    #         load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            # perform training
+            with Timer(name="update_policy", logger=None) as timer:
+                active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
+                with self.switch_adapter(active_adapter):
+                    metrics = self.actor.update_policy(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-    #     # 1) load base checkpoint (model/optimizer/scheduler/tokenizer)
-    #     self.checkpoint_manager.load_checkpoint(
-    #         local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
-    #     )
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            self.actor_lr_scheduler.step()
 
-    #     # 2) load LoRA adapters if present
-    #     try:
-    #         peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-    #         lora_root = os.path.join(local_path, "lora_adapter")
-    #         if os.path.isdir(lora_root) and hasattr(peft_model, "load_adapter"):
-    #             # enumerate subfolders as adapter names
-    #             for name in sorted(os.listdir(lora_root)):
-    #                 subdir = os.path.join(lora_root, name)
-    #                 if not os.path.isdir(subdir):
-    #                     continue
-    #                 cfg_path = os.path.join(subdir, "adapter_config.json")
-    #                 w_path = os.path.join(subdir, "adapter_model.safetensors")
-    #                 if not (os.path.isfile(cfg_path) and os.path.isfile(w_path)):
-    #                     continue
+            # TODO: here, we should return all metrics
+            output = DataProto(meta_info={"metrics": metrics})
 
-    #                 # If adapter exists already, replace it
-    #                 if hasattr(peft_model, "peft_config") and name in peft_model.peft_config:
-    #                     try:
-    #                         peft_model.delete_adapter(name)
-    #                     except Exception:
-    #                         pass
+            output = output.to("cpu")
 
-    #                 # Load adapter folder; PEFT will map 'default' -> given name
-    #                 peft_model.load_adapter(subdir, adapter_name=name)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
-    #                 log_with_rank(
-    #                     f"[rank-{self.rank}]: Loaded LoRA adapter ({name}) from: {subdir}",
-    #                     rank=dist.get_rank(),
-    #                     logger=logger,
-    #                     log_only_rank_0=True,
-    #                 )
-                    
-    #     except Exception as e:
-    #         # Do not fail the whole checkpoint load if adapters fail
-    #         from verl.utils.logger import log_with_rank
-    #         log_with_rank(
-    #             f"Load LoRA Adapters Warning ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-    #         )
-
-    #     if self._is_offload_param:
-    #         offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
-    #     if self._is_offload_optimizer:
-    #         offload_fsdp_optimizer(self.actor_optimizer)
-
+        return output
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
