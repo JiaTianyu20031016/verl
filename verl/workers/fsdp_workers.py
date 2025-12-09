@@ -136,6 +136,19 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def _expand_to_token_level(data: DataProto, scores: torch.Tensor) -> torch.Tensor:
+        attention_mask = data.batch["attention_mask"]
+        position_ids = data.batch["position_ids"]
+        response_length = data.batch["responses"].shape[-1]
+        if position_ids.dim() == 3:
+            position_ids = position_ids[:, 0, :]
+        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
+        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
+        token_level_scores[torch.arange(scores.size(0)), eos_mask_idx] = scores
+        token_level_scores = token_level_scores[:, -response_length:]
+        return token_level_scores
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -868,7 +881,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
-        breakpoint()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1793,23 +1805,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             rm_score = rm_score[torch.arange(batch_size), eos_mask_idx]
             return rm_score
 
-    def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor):
-        batch_size = data.batch.batch_size[0]
-        # expand as token_level_reward
-        attention_mask = data.batch["attention_mask"]
-        position_ids = data.batch["position_ids"]
-        response_length = data.batch["responses"].shape[-1]
-        if position_ids.dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
-            position_ids = position_ids[:, 0, :]
-        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)  # (bsz,)
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)  # (bsz, seqlen)
-        token_level_scores[torch.arange(batch_size), eos_mask_idx] = scores
-
-        # select the response part
-        token_level_scores = token_level_scores[:, -response_length:]
-
-        return token_level_scores
-
     def _switch_chat_template(self, data: DataProto):
         src_max_length = data.batch["attention_mask"].shape[-1]
 
@@ -1920,7 +1915,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 scores = scores[revert_indices]
 
-            token_level_scores = self._expand_to_token_level(data, scores)
+            token_level_scores = _expand_to_token_level(data, scores)
             # Note that this is only the scores, may not be the final rewards used to train RL
             output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
 
@@ -2180,17 +2175,6 @@ class GenerativeRewardModelWorker(Worker, DistProfilerExtension):
             scores.append(val)
         return torch.tensor(scores, dtype=torch.float32, device=get_device_id())
 
-    def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor) -> torch.Tensor:
-        attention_mask = data.batch["attention_mask"]
-        position_ids = data.batch["position_ids"]
-        response_length = data.batch["responses"].shape[-1]
-        if position_ids.dim() == 3:
-            position_ids = position_ids[:, 0, :]
-        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
-        token_level_scores[torch.arange(scores.size(0)), eos_mask_idx] = scores
-        token_level_scores = token_level_scores[:, -response_length:]
-        return token_level_scores
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="orange")
@@ -2204,7 +2188,7 @@ class GenerativeRewardModelWorker(Worker, DistProfilerExtension):
             mb_scores = self._forward_micro_batch(mb_texts)
             outputs.append(mb_scores)
         scores = torch.cat(outputs, dim=0)
-        token_level_scores = self._expand_to_token_level(data, scores)
+        token_level_scores = _expand_to_token_level(data, scores)
         output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
         if self.device_mesh.size() > 1 and fsdp_version(getattr(self, "judge_module", None)) == 1:
             try:
@@ -2271,14 +2255,14 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
-        # 也为 reward mesh 注册收集信息（供 compute_rm_score 使用）
-        if self.ulysses_device_mesh is not None:
-            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
-            self._register_dispatch_collect_info(
-                "reward", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
-            )
-        else:
-            self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
+        # # 也为 reward mesh 注册收集信息（供 compute_rm_score 使用）
+        # if self.ulysses_device_mesh is not None:
+        #     is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+        #     self._register_dispatch_collect_info(
+        #         "reward", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+        #     )
+        # else:
+        #     self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
 
         # 与原类相同的 LoRA / offload / use_orig_params 标记
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
@@ -2324,16 +2308,37 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             "judge_prompt_template",
             (
                 '''
-                You are an impartial mathematical reasoning judge. Given a math problem and a chain-of-thought, 
-                evaluate the correctness of each reasoning step (not only the final answer).\n\n
+                You are an impartial mathematical reasoning judge. Given a math problem and a chain-of-thought (CoT), 
+                evaluate the correctness of the reasoning.\n\n
                 Instructions:\n
                 - First, concisely analyze the reasoning step-by-step, judging correctness and pointing out errors.\n
-                - Then give an overall integer score from 0 to 10 based on your analysis.\n\n
+                - Then give an overall integer score from 0 to 10 based on your analysis. \n
+                - If the CoT seems incomplete or truncated (e.g., ends abruptly, or does not contain the final answer wrapped in \\box{{...}} in the CoT), directly assign a score of 0. \n
+                - If the final answer of the reasoning is correct, assign a score between 6 and 10. The specific score depends on the correctness and completeness of the intermediate reasoning steps. If there are flaws in intermediate reasoning steps, make deductions from the full score of 10 as appropriate.\n
+                - If the final answer of the reasoning is incorrect, assign a score between 0 and 5. The specific score depends on the correctness and completeness of the intermediate reasoning steps. If there are partially correct intermediate reasoning steps, add points to the base score of 0 as appropriate. Assign a score of 0 to CoT with fundamental errors or clearly incorrect. \n\n
                 Format requirements:\n
                 - Wrap your analysis in <think>...</think>.\n
                 - Wrap the final integer score in <score>...</score>.\n
                 - Your output shoule look like <think>your analysis here</think><score>your score here</score>\n\n
-                [Problem]\n{prompt}\n\n[Chain-of-Thought]\n{response}\n\n
+                [Problem]\n{prompt}\n\n[Chain-of-Thought]\n{response}\n\n[Your Judgement]\n
+                '''
+            ),
+        )
+        self.judge_template_with_ref = self.config.get(
+            "judge_prompt_template_with_ref",
+            (
+                '''
+                You are an impartial mathematical reasoning judge. Given a math problem, the ground-truth answer to the problem, and a chain-of-thought reasoning, 
+                evaluate the correctness of the given reasoning.\n\n
+                Instructions:\n
+                - If the answer of the given reasoning is consistent with the ground-truth answer, and the reasoning is logically correct, assign a score of 1.\n
+                - If the answer of the given reasoning is inconsistent with the ground-truth answer, or the reasoning is incomplete (truncated), assign a score of 0.\n\n
+                Format requirements:\n
+                - First give a concise analysis of your judgement, then output the score.\n
+                - Wrap your analysis in <think>...</think>.\n
+                - Wrap the integer score in <score>...</score>.\n
+                - Your output shoule look like <think>your analysis here</think><score>0 or 1</score>\n\n
+                [Problem]\n{prompt}\n\n[Ground Truth Answer]\n{ground_truth}\n\n[Chain-of-Thought]\n{response}\n\n[Your Score]\n
                 '''
             ),
         )
@@ -2342,7 +2347,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         )
         self.score_min = float(self.config.get("judge_score_min", 0.0))
         self.score_max = float(self.config.get("judge_score_max", 10.0))
-        self.normalize_score = bool(self.config.get("judge_normalize", True))
+        self.normalize_score = bool(self.config.get("judge_normalize", False))
         self.max_new_tokens = int(self.config.get("judge_max_new_tokens", 64))
         self.temperature = float(self.config.get("judge_temperature", 0.1))
 
@@ -2726,7 +2731,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         #     elif active_hint is not None:
         #         print(f"[DualLoRA] Invalid active_adapter_name='{active_hint}', fallback to '{self.current_adapter}'")
         #     # note that this hint must be removed, because self.config.model will be converted into HFModelConfig later
-        #     breakpoint()
         #     self.config.model.pop("active_adapter_name")
         # except Exception as e:
         #     print(f"[DualLoRA] Failed to apply active_adapter_name hint: {e}")
@@ -2763,12 +2767,16 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     # ------------- Actor interfaces -------------
     def do_switch_adapter(self, name: str):
-        if name not in ("actor1", "actor2"):
+        if name not in ("actor1", "actor2", "shared", "None"):
             raise ValueError(f"Unknown adapter name '{name}'")
         self.current_adapter = name
-        # shared adapter is always activated
         try:
-            self.actor_module_fsdp.set_adapter([name, 'shared'])
+            if name == "None":
+                self.actor_module_fsdp.set_adapter([])
+            elif name == "shared":
+                self.actor_module_fsdp.set_adapter(['shared'])
+            else:
+                self.actor_module_fsdp.set_adapter([name, 'shared'])
         except Exception:
             raise ValueError(f"Failed to switch to adapter '{name}'")
     
@@ -3079,7 +3087,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         # 完全复用 ActorRolloutRefWorker.compute_log_prob，加入适配器切换
-        # breakpoint()
         assert hasattr(self, "actor")
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -3147,7 +3154,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     # ------------- RewardModel interfaces (actor1 as judge) -------------
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    def _build_judge_inputs(self, data: DataProto, src_tokenizer=None, dst_tokenizer=None, max_length=None) -> dict:
+    def _build_judge_inputs(self, data: DataProto) -> dict:
         """Return tokenized judge inputs dict aligned with RLHFDataset.__getitem__.
 
         Keys:
@@ -3156,14 +3163,14 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
           - position_ids: list[Tensor]
           - raw_prompt_ids: list[list[int]]
         """
-        src_tokenizer = self.tokenizer if src_tokenizer is None else src_tokenizer
-        dst_tokenizer = self.tokenizer if dst_tokenizer is None else dst_tokenizer
+        src_tokenizer = data.meta_info.get("src_tokenizer", self.tokenizer)
+        dst_tokenizer = data.meta_info.get("dst_tokenizer", self.tokenizer)
         batch_size = data.batch.batch_size[0]
         attention_mask = data.batch["attention_mask"]
         input_ids = data.batch.get("input_ids")
         responses = data.batch.get("responses")
         prompts = data.batch.get("prompts")
-        max_len = max_length if max_length is not None else prompts.shape[-1] + responses.shape[-1]
+        max_len = data.meta_info.get("max_length", prompts.shape[-1])
 
         outputs = {
             "input_ids": [],
@@ -3194,14 +3201,33 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
                 prompt_str = src_tokenizer.decode(prompt_ids_valid, skip_special_tokens=True)
             
             # decode response
-            response_window_len = responses[i].shape[-1]
-            valid_response_len = attention_mask[i][-response_window_len:].sum()
-            # note that responses are paddd on the right
-            response_ids_valid = responses[i][:valid_response_len]
-            response_str = src_tokenizer.decode(response_ids_valid, skip_special_tokens=True)
+            if data.non_tensor_batch.get('raw_response', None) is not None:
+                # read response from non-tensor batch if available
+                assert data.non_tensor_batch['raw_response'][i][-1]['role'] == 'assistant'
+                response_str = data.non_tensor_batch['raw_response'][i][-1]['content']
+            else:
+                response_window_len = responses[i].shape[-1]
+                valid_response_len = attention_mask[i][-response_window_len:].sum()
+                # note that responses are paddd on the right
+                response_ids_valid = responses[i][:valid_response_len]
+                response_str = src_tokenizer.decode(response_ids_valid, skip_special_tokens=True)
             
             # formulate judge prompt
-            judge_prompt = self.judge_template.format(prompt=prompt_str, response=response_str)
+            if data.meta_info.get("use_ref", False) is False:
+                judge_prompt = self.judge_template.format(prompt=prompt_str, response=response_str)
+            else:
+                assert "ref_answers" in data.non_tensor_batch, "ref_answers required for ref judge prompt"
+                if isinstance( data.non_tensor_batch.get("ref_answers")[i], str):
+                    ref_answer = data.non_tensor_batch.get("ref_answers")[i]
+                else:
+                    assert data.non_tensor_batch.get("ref_answers")[i][-1]['role'] == 'assistant'
+                    ref_answer = data.non_tensor_batch.get("ref_answers")[i][-1]['content']
+                judge_prompt = self.judge_template_with_ref.format(
+                    prompt=prompt_str, 
+                    response=response_str, 
+                    ground_truth=ref_answer
+                )
+
             messages = [{"role": "user", "content": judge_prompt}]
             judge_prompt = dst_tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
@@ -3237,159 +3263,11 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         outputs_batch.batch["attention_mask"] = torch.stack(outputs["attention_mask"], dim=0)
         outputs_batch.batch["position_ids"] = torch.stack(outputs["position_ids"], dim=0)
         outputs_batch.non_tensor_batch["raw_judge_prompt"] = np.asarray(outputs["raw_prompt"])
+        outputs_batch.pop(batch_keys=["prompts", "responses"])
         return outputs_batch
 
 
-    def _forward_micro_batch_judge(self, judge_texts: list[str]) -> torch.Tensor:
-        # 优先使用 rollout 引擎（vLLM/SGLang等）进行加速；若不可用再退回 HF generate
-        # self._switch_adapter("actor1")
-        gen_texts = []
-        if hasattr(self, "rollout") and self.rollout is not None:
-            # 构造 DataProto，复用 generate_sequences 的推理通路
-            eff_rollout = self._get_effective_cfg("actor1", "rollout")
-            prompts_dp = DataProto.from_dict(
-                tensors={},
-                non_tensor_batch={"raw_prompt": judge_texts},
-                meta_info={
-                    "active_adapter": "actor1",
-                    "eos_token_id": self.generation_config.eos_token_id
-                        if getattr(self, "generation_config", None) is not None
-                        else self.tokenizer.eos_token_id,
-                    "pad_token_id": self.generation_config.pad_token_id
-                        if getattr(self, "generation_config", None) is not None
-                        else self.tokenizer.pad_token_id,
-                    "do_sample": getattr(eff_rollout, "do_sample", True)
-                        if not isinstance(eff_rollout, dict) else eff_rollout.get("do_sample", True),
-                    },
-            ).to(get_device_id())
-
-            # 切换到 rollout 模式生成
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
-            try:
-                # 对支持的引擎（如 vLLM）使用采样覆盖；否则回退到 meta_info 注入
-                sampling_overrides = {
-                    "temperature": (
-                        getattr(eff_rollout, "temperature", None)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("temperature")
-                    ),
-                    "top_p": (
-                        getattr(eff_rollout, "top_p", None)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("top_p")
-                    ),
-                    "top_k": (
-                        getattr(eff_rollout, "top_k", None)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("top_k")
-                    ),
-                    "max_tokens": (
-                        getattr(eff_rollout, "response_length", None)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("response_length")
-                    ),
-                }
-                sampling_overrides = {k: v for k, v in sampling_overrides.items() if v is not None}
-
-                if hasattr(self.rollout, "update_sampling_params") and callable(
-                    getattr(self.rollout, "update_sampling_params")
-                ) and sampling_overrides:
-                    with self.rollout.update_sampling_params(**sampling_overrides):
-                        output = self.rollout.generate_sequences(prompts=prompts_dp)
-                else:
-                    # 回退：补齐旧的 meta_info 字段以求最大兼容
-                    prompts_dp.meta_info.update(
-                        {
-                            "temperature": sampling_overrides.get("temperature", 1.0),
-                            "top_p": sampling_overrides.get("top_p", 1.0),
-                            "top_k": sampling_overrides.get("top_k", -1),
-                            "response_length": sampling_overrides.get(
-                                "max_tokens", self.config.rollout.response_length
-                            ),
-                        }
-                    )
-                    output = self.rollout.generate_sequences(prompts=prompts_dp)
-            finally:
-                loop.run_until_complete(self.trainer_mode())
-
-            # output.non_tensor_batch 或 tensors 中应含生成文本/ids，兼容常见实现
-            if hasattr(output, "non_tensor_batch") and "responses_text" in output.non_tensor_batch:
-                gen_texts = list(output.non_tensor_batch["responses_text"])  # list[str]
-            elif hasattr(output, "tensors") and "responses" in output.tensors:
-                # 从 token ids 解码
-                resp_ids = output.tensors["responses"].to(get_device_id())
-                for i in range(resp_ids.shape[0]):
-                    gen_texts.append(self.tokenizer.decode(resp_ids[i], skip_special_tokens=True))
-            else:
-                # 兜底：无法解析 rollout 输出，回退到 HF
-                gen_texts = []
-
-        if len(gen_texts) == 0:
-            # 回退到 HF generate
-            eff_rollout = self._get_effective_cfg("actor1", "rollout")
-            max_len = getattr(eff_rollout, "max_model_len", 4096)
-            enc = self.tokenizer(
-                judge_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_len,
-            )
-            input_ids = enc["input_ids"].to(get_device_id())
-            attention_mask = enc["attention_mask"].to(get_device_id())
-            with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-                gen_out = self.actor_module_fsdp.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=(
-                        getattr(eff_rollout, "response_length", self.config.rollout.response_length)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("response_length", self.config.rollout.response_length)
-                    ),
-                    do_sample=(
-                        (getattr(eff_rollout, "temperature", 1.0) if not isinstance(eff_rollout, dict) else eff_rollout.get("temperature", 1.0))
-                        > 0
-                    ),
-                    temperature=(
-                        getattr(eff_rollout, "temperature", 1.0)
-                        if not isinstance(eff_rollout, dict)
-                        else eff_rollout.get("temperature", 1.0)
-                    ),
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            for i in range(gen_out.shape[0]):
-                orig_len = (attention_mask[i] == 1).sum().item()
-                new_tokens = gen_out[i][orig_len:]
-                text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-                gen_texts.append(text)
-        scores = []
-        for txt in gen_texts:
-            m = self.score_pattern.search(txt)
-            if m:
-                val = float(m.group(1))
-            else:
-                val = 0.0
-            val = max(self.score_min, min(self.score_max, val))
-            if self.normalize_score and self.score_max > self.score_min:
-                val = (val - self.score_min) / (self.score_max - self.score_min)
-            scores.append(val)
-        return torch.tensor(scores, dtype=torch.float32, device=get_device_id())
-
-    def _expand_to_token_level(self, data: DataProto, scores: torch.Tensor) -> torch.Tensor:
-        attention_mask = data.batch["attention_mask"]
-        position_ids = data.batch["position_ids"]
-        response_length = data.batch["responses"].shape[-1]
-        if position_ids.dim() == 3:
-            position_ids = position_ids[:, 0, :]
-        eos_mask_idx = torch.argmax(position_ids * attention_mask, dim=-1)
-        token_level_scores = torch.zeros_like(attention_mask, dtype=scores.dtype)
-        token_level_scores[torch.arange(scores.size(0)), eos_mask_idx] = scores
-        token_level_scores = token_level_scores[:, -response_length:]
-        return token_level_scores
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="orange")
     def compute_rm_score(self, data: DataProto):
         # 从 data.batch['judge_response'] 解码并解析评分；失败样本标注 reward valid=False
@@ -3433,7 +3311,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             judge_texts = np.asarray(judge_texts)
 
         # 扩展为逐 token 奖励，仅在响应区间最后一个 token 处赋值
-        token_level_scores = self._expand_to_token_level(data, scores)
+        token_level_scores = _expand_to_token_level(data, scores)
 
         # 输出并附加有效性标志到 batch
         output = DataProto.from_single_dict(
@@ -3449,6 +3327,67 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        # from verl.utils.logger import log_with_rank
+
+        # # only support save and load ckpt for actor
+        # assert self._is_actor
+
+        # if self._is_offload_param:
+        #     load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        # self.checkpoint_manager.save_checkpoint(
+        #     local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+        # )
+        # dist.barrier()
+
+        # # Save all LoRA adapters separately (shared/actor1/actor2/...)
+        # if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+        #     lora_root = os.path.join(local_path, "lora_adapter")
+        #     peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+        #     adapter_names = list(getattr(peft_model, "peft_config", {}).keys())
+        #     if dist.get_rank() == 0:
+        #         os.makedirs(lora_root, exist_ok=True)
+        #     try:
+        #         if fsdp_version(self.actor_module_fsdp) > 0:
+        #             self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+        #         for name in adapter_names:
+        #             # 1) dump config per adapter
+        #             if dist.get_rank() == 0:
+        #                 cfg = peft_model.peft_config.get(name, None)
+        #                 if cfg is None:
+        #                     continue
+        #                 peft_config = asdict(cfg)
+        #                 peft_config["task_type"] = peft_config["task_type"].value
+        #                 peft_config["peft_type"] = peft_config["peft_type"].value
+        #                 peft_config["target_modules"] = list(peft_config["target_modules"])
+
+        #                 subdir = os.path.join(lora_root, name)
+        #                 os.makedirs(subdir, exist_ok=True)
+        #                 with open(os.path.join(subdir, "adapter_config.json"), "w", encoding="utf-8") as f:
+        #                     json.dump(peft_config, f, ensure_ascii=False, indent=4)
+
+        #             # 2) dump weights per adapter (keys are filtered to that adapter by API)
+        #             if fsdp_version(self.actor_module_fsdp) > 0:
+        #                 lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=name)
+        #                 if dist.get_rank() == 0:
+        #                     save_file(lora_params, os.path.join(subdir, "adapter_model.safetensors"))
+                    
+        #             log_with_rank(
+        #                 f"[rank-{self.rank}]: Saved LoRA adapter ({name}) to: {subdir}",
+        #                 rank=dist.get_rank(),
+        #                 logger=logger,
+        #                 log_only_rank_0=True,
+        #             )
+            
+        #     except Exception as e:
+        #         log_with_rank(
+        #             f"Save LoRA Adapters Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+        #         )
+
+        #     dist.barrier()
+        
+        # if self._is_offload_param:
+        #     offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         from verl.utils.logger import log_with_rank
 
         # only support save and load ckpt for actor
@@ -3462,125 +3401,117 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         )
         dist.barrier()
 
-        # Save all LoRA adapters separately (shared/actor1/actor2/...)
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
-
-            lora_root = os.path.join(local_path, "lora_adapter")
+            lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+            peft_config = {}
+            if dist.get_rank() == 0:
+                os.makedirs(lora_save_path, exist_ok=True)
+                for name in peft_model.peft_config.keys():
+                    peft_config = asdict(peft_model.peft_config.get(name, {}))
+                    peft_config["task_type"] = peft_config["task_type"].value
+                    peft_config["peft_type"] = peft_config["peft_type"].value
+                    peft_config["target_modules"] = list(peft_config["target_modules"])
+                    subdir = os.path.join(lora_save_path, name)
+                    os.makedirs(subdir, exist_ok=True)
+                    with open(os.path.join(subdir, "adapter_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(peft_config, f, ensure_ascii=False, indent=4)
+
             try:
-                # Ensure model is on device for summon
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
-
-                adapter_names = list(getattr(peft_model, "peft_config", {}).keys())
-                if dist.get_rank() == 0:
-                    os.makedirs(lora_root, exist_ok=True)
-
-                for name in adapter_names:
-                    # 1) dump config per adapter
-                    if dist.get_rank() == 0:
-                        cfg = peft_model.peft_config.get(name, None)
-                        if cfg is None:
-                            continue
-                        cfg_dict = asdict(cfg)
-                        # Enum -> value
-                        if hasattr(cfg_dict.get("task_type", None), "value"):
-                            cfg_dict["task_type"] = cfg_dict["task_type"].value
-                        if hasattr(cfg_dict.get("peft_type", None), "value"):
-                            cfg_dict["peft_type"] = cfg_dict["peft_type"].value
-                        if isinstance(cfg_dict.get("target_modules", None), set):
-                            cfg_dict["target_modules"] = list(cfg_dict["target_modules"])
-
-                        subdir = os.path.join(lora_root, name)
-                        os.makedirs(subdir, exist_ok=True)
-                        with open(os.path.join(subdir, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(cfg_dict, f, ensure_ascii=False, indent=4)
-
-                    # 2) dump weights per adapter (keys are filtered to that adapter by API)
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=name)
-                    if dist.get_rank() == 0:
-                        subdir = os.path.join(lora_root, name)
-                        os.makedirs(subdir, exist_ok=True)
-                        save_file(lora_params, os.path.join(subdir, "adapter_model.safetensors"))
-
+                    for name in peft_model.peft_config.keys():
+                        lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=name)
+                        if dist.get_rank() == 0:
+                            save_file(lora_params, os.path.join(lora_save_path, name, "adapter_model.safetensors"))
+            
             except Exception as e:
                 log_with_rank(
-                    f"Save LoRA Adapters Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
                 )
 
             dist.barrier()
-            if dist.get_rank() == 0:
-                saved_list = ", ".join(list(getattr(peft_model, "peft_config", {}).keys()))
-                log_with_rank(
-                    f"[rank-{self.rank}]: Saved LoRA adapters ({saved_list}) to: {lora_root}",
-                    rank=dist.get_rank(),
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
-
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-        """Load base FSDP checkpoint and all LoRA adapters for Dual-LoRA actor."""
-        assert self._is_actor or (not self._is_actor and self._is_rollout), (
-            f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
-            f"{self._is_actor} and {self._is_rollout}"
-        )
-
-        # No checkpoint to load: just offload
-        if local_path is None:
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(self.actor_optimizer)
-            return
-
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-        # 1) load base checkpoint (model/optimizer/scheduler/tokenizer)
-        self.checkpoint_manager.load_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
-        )
-
-        # 2) load LoRA adapters if present
-        try:
-            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            lora_root = os.path.join(local_path, "lora_adapter")
-            if os.path.isdir(lora_root) and hasattr(peft_model, "load_adapter"):
-                # enumerate subfolders as adapter names
-                for name in sorted(os.listdir(lora_root)):
-                    subdir = os.path.join(lora_root, name)
-                    if not os.path.isdir(subdir):
-                        continue
-                    cfg_path = os.path.join(subdir, "adapter_config.json")
-                    w_path = os.path.join(subdir, "adapter_model.safetensors")
-                    if not (os.path.isfile(cfg_path) and os.path.isfile(w_path)):
-                        continue
-
-                    # If adapter exists already, replace it
-                    if hasattr(peft_model, "peft_config") and name in peft_model.peft_config:
-                        try:
-                            peft_model.delete_adapter(name)
-                        except Exception:
-                            pass
-
-                    # Load adapter folder; PEFT will map 'default' -> given name
-                    peft_model.load_adapter(subdir, adapter_name=name)
-        except Exception as e:
-            # Do not fail the whole checkpoint load if adapters fail
-            from verl.utils.logger import log_with_rank
             log_with_rank(
-                f"Load LoRA Adapters Warning ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
+                rank=dist.get_rank(),
+                logger=logger,
+                log_only_rank_0=True,
             )
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(self.actor_optimizer)
+
+    # use ActorRefRollout.load_checkpoint instead
+    # @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    # def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+    #     """Load base FSDP checkpoint and all LoRA adapters for Dual-LoRA actor."""
+    #     assert self._is_actor or (not self._is_actor and self._is_rollout), (
+    #         f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
+    #         f"{self._is_actor} and {self._is_rollout}"
+    #     )
+
+    #     # No checkpoint to load: just offload
+    #     if local_path is None:
+    #         if self._is_offload_param:
+    #             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+    #         if self._is_offload_optimizer:
+    #             offload_fsdp_optimizer(self.actor_optimizer)
+    #         return
+
+    #     if self._is_offload_param:
+    #         load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+    #     # 1) load base checkpoint (model/optimizer/scheduler/tokenizer)
+    #     self.checkpoint_manager.load_checkpoint(
+    #         local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+    #     )
+
+    #     # 2) load LoRA adapters if present
+    #     try:
+    #         peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+    #         lora_root = os.path.join(local_path, "lora_adapter")
+    #         if os.path.isdir(lora_root) and hasattr(peft_model, "load_adapter"):
+    #             # enumerate subfolders as adapter names
+    #             for name in sorted(os.listdir(lora_root)):
+    #                 subdir = os.path.join(lora_root, name)
+    #                 if not os.path.isdir(subdir):
+    #                     continue
+    #                 cfg_path = os.path.join(subdir, "adapter_config.json")
+    #                 w_path = os.path.join(subdir, "adapter_model.safetensors")
+    #                 if not (os.path.isfile(cfg_path) and os.path.isfile(w_path)):
+    #                     continue
+
+    #                 # If adapter exists already, replace it
+    #                 if hasattr(peft_model, "peft_config") and name in peft_model.peft_config:
+    #                     try:
+    #                         peft_model.delete_adapter(name)
+    #                     except Exception:
+    #                         pass
+
+    #                 # Load adapter folder; PEFT will map 'default' -> given name
+    #                 peft_model.load_adapter(subdir, adapter_name=name)
+
+    #                 log_with_rank(
+    #                     f"[rank-{self.rank}]: Loaded LoRA adapter ({name}) from: {subdir}",
+    #                     rank=dist.get_rank(),
+    #                     logger=logger,
+    #                     log_only_rank_0=True,
+    #                 )
+                    
+    #     except Exception as e:
+    #         # Do not fail the whole checkpoint load if adapters fail
+    #         from verl.utils.logger import log_with_rank
+    #         log_with_rank(
+    #             f"Load LoRA Adapters Warning ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
+    #         )
+
+    #     if self._is_offload_param:
+    #         offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    #     if self._is_offload_optimizer:
+    #         offload_fsdp_optimizer(self.actor_optimizer)
+
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):

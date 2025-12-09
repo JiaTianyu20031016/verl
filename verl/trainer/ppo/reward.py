@@ -20,16 +20,19 @@ import sys
 import warnings
 from functools import partial
 from typing import Any, Optional
+import numpy as np
 
 import ray
 import torch
 from omegaconf import DictConfig
+from collections import defaultdict
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.reward_manager import get_reward_manager_cls
 from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
+from verl.workers.fsdp_workers import _expand_to_token_level
 
 
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
@@ -205,3 +208,80 @@ def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn
         )
 
     return compute_reward(data, reward_fn)
+
+    
+def compute_GAN_like_reward(neg_batch: DataProto, pos_batch: DataProto, mode: str = "sum"):
+    """Compute pairwise GAN-like rewards for paired positive/negative samples.
+
+    Args:
+        neg_batch: Batch of negative samples.
+        pos_batch: Batch of positive samples.
+        mode: Reward post-processing mode:
+            - "sum" (default): wins - losses (current behavior).
+            - "binary": 1 if reward > 0 else -1 (invalid samples stay 0).
+            - "normalized": scale sum-mode rewards to [-1, 1] by max |reward| in batch (invalid stay 0).
+    """
+
+    with torch.no_grad():
+        neg_scores = torch.sum(neg_batch.batch["token_level_scores"], dim=-1)
+        pos_scores = torch.sum(pos_batch.batch["token_level_scores"], dim=-1)
+
+        neg_valids = neg_batch.non_tensor_batch.get("rm_valids", None)
+        pos_valids = pos_batch.non_tensor_batch.get("rm_valids", None)
+        if neg_valids is None:
+            neg_valids = np.ones(len(neg_scores), dtype=bool)
+        if pos_valids is None:
+            pos_valids = np.ones(len(pos_scores), dtype=bool)
+
+        neg_uid = neg_batch.non_tensor_batch.get("uid", None)
+        pos_uid = pos_batch.non_tensor_batch.get("uid", None)
+        if neg_uid is None or pos_uid is None:
+            raise ValueError("UIDs must be provided in both neg_batch and pos_batch for GAN-like reward computation.")
+
+        neg_rewards = torch.zeros_like(neg_scores)
+        pos_rewards = torch.zeros_like(pos_scores)
+
+        # group indices by uid
+        uid_to_neg = defaultdict(list)
+        uid_to_pos = defaultdict(list)
+        for idx, uid in enumerate(neg_uid):
+            uid_to_neg[uid].append(idx)
+        for idx, uid in enumerate(pos_uid):
+            uid_to_pos[uid].append(idx)
+
+        # compute pairwise wins-losses within each uid group
+        for uid in set(list(uid_to_neg.keys()) + list(uid_to_pos.keys())):
+            # invalid samples are skipped
+            neg_indices = [i for i in uid_to_neg.get(uid, []) if neg_valids[i]]
+            pos_indices = [i for i in uid_to_pos.get(uid, []) if pos_valids[i]]
+
+            for i in pos_indices:
+                for j in neg_indices:
+                    pos_rewards[i] += pos_scores[i] - neg_scores[j]
+                    neg_rewards[j] += pos_scores[i] - neg_scores[j]
+
+        # post-process by mode
+        mode = (mode or "sum").lower()
+        pos_mask = torch.as_tensor(pos_valids, device=pos_rewards.device, dtype=torch.bool)
+        neg_mask = torch.as_tensor(neg_valids, device=neg_rewards.device, dtype=torch.bool)
+
+        if mode == "binary":
+            pos_rewards = torch.where(pos_mask, torch.where(pos_rewards > 0, torch.ones_like(pos_rewards), -torch.ones_like(pos_rewards)), torch.zeros_like(pos_rewards))
+            neg_rewards = torch.where(neg_mask, torch.where(neg_rewards > 0, torch.ones_like(neg_rewards), -torch.ones_like(neg_rewards)), torch.zeros_like(neg_rewards))
+        elif mode == "normalized":
+            valid_concat = []
+            if pos_mask.any():
+                valid_concat.append(torch.abs(pos_rewards[pos_mask]))
+            if neg_mask.any():
+                valid_concat.append(torch.abs(neg_rewards[neg_mask]))
+            max_abs = torch.max(torch.cat(valid_concat)) if len(valid_concat) > 0 else None
+            if max_abs is not None and max_abs > 0:
+                pos_rewards = torch.where(pos_mask, pos_rewards / max_abs, torch.zeros_like(pos_rewards))
+                neg_rewards = torch.where(neg_mask, neg_rewards / max_abs, torch.zeros_like(neg_rewards))
+        else:
+            # sum mode: keep as-is; invalids already zeroed
+            pass
+
+        # expand back to token level
+        neg_batch.batch["token_level_scores"] = _expand_to_token_level(neg_batch, neg_rewards)
+        pos_batch.batch["token_level_scores"] = _expand_to_token_level(pos_batch, pos_rewards)

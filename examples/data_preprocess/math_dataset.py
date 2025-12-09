@@ -23,10 +23,32 @@ import datasets
 
 from verl.utils.hdfs_io import copy, makedirs
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+import re
+import regex
 
 
 def extract_solution(solution_str):
-    return remove_boxed(last_boxed_only_string(solution_str))
+    # 递归匹配 \boxed{ ... }，内部支持任意嵌套花括号
+    pattern = r"""
+        \\boxed{
+            (?<content>                # 定义递归组 content
+                (?:                    # 非捕获组
+                    [^{}]+             # 不是 { 或 }
+                    |                  # 或
+                    {(?&content)}      # 递归匹配嵌套 {...}
+                )*
+            )
+        }
+    """
+    matches = regex.findall(pattern, solution_str, flags=regex.VERBOSE)
+    if matches:
+        return matches[-1]   # 返回最后一个 boxed 内容
+    return solution_str
+
+
+def filter_by_level(example, levels):
+    """Filter examples by difficulty levels."""
+    return example["level"] in levels
 
 
 if __name__ == "__main__":
@@ -34,6 +56,7 @@ if __name__ == "__main__":
     parser.add_argument("--local_dir", default=None)
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--local_dataset_path", default=None, help="The local path to the raw dataset, if it exists.")
+    parser.add_argument("--dataset_name", default="DigitalLearningGmbH/MATH-lighteval", help="The name of the dataset to preprocess.")
     parser.add_argument(
         "--local_save_dir", default="~/data/math", help="The save directory for the preprocessed dataset."
     )
@@ -43,7 +66,7 @@ if __name__ == "__main__":
 
     # 'lighteval/MATH' is no longer available on huggingface.
     # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
-    data_source = "DigitalLearningGmbH/MATH-lighteval"
+    data_source = args.dataset_name
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
     if local_dataset_path is not None:
         dataset = datasets.load_dataset(
@@ -54,26 +77,37 @@ if __name__ == "__main__":
             data_source,
         )
 
+    dataset = dataset.filter(lambda x: filter_by_level(x, levels=["Level 5"]))
+
+    if "test" not in dataset:
+        # split a small number of examples from train as test
+        print("Splitting test set from train set...", flush=True)
+        dataset = dataset["train"].train_test_split(test_size=0.02, seed=42)
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    instruction_following = "Let's think step by step and wrap the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question = example.pop("problem")
+            raw_question = example.pop("problem")
 
-            question = question + " " + instruction_following
+            question = raw_question + " " + instruction_following
 
-            answer = example.pop("solution")
-            solution = extract_solution(answer)
+            raw_answer = example.pop("solution")
+            solution = extract_solution(raw_answer)
             data = {
                 "data_source": data_source,
                 "prompt": [{"role": "user", "content": question}],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
-                "extra_info": {"split": split, "index": idx},
+                "extra_info": {
+                    "split": split, 
+                    "index": idx,
+                    "answer": raw_answer,
+                    "question": raw_question,
+                },
             }
             return data
 
