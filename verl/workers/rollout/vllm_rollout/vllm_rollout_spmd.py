@@ -378,9 +378,7 @@ class vLLMRollout(BaseRollout):
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
-                # Note: here we always use the last loaded LoRA adapter for rollout
-                assert len(lora_int_ids) == 1, "Only support one LoRA adapter during rollout."
-                lora_int_id = lora_int_ids[-1]
+                lora_int_id = lora_int_ids[0]
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
@@ -485,16 +483,16 @@ class vLLMRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
-            # Make sure the old lora is removed before adding the new one
-            self.inference_engine.llm_engine.remove_lora(VLLM_LORA_INT_ID)
-            lora_request = TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
+
+            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+            lora_reqest = TensorLoRARequest(
+                lora_name=f"{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
                 lora_tensors=dict(weights),
             )
-            self.inference_engine.llm_engine.add_lora(lora_request)
+            self.inference_engine.llm_engine.add_lora(lora_reqest)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader

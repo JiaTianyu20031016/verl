@@ -365,7 +365,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     from torch.utils.data import Dataset
 
     from verl.utils.dataset.rl_dataset import RLHFDataset
-    breakpoint()
 
     # Check if a custom dataset class is specified in the data configuration
     # and if the path to the custom class is provided
