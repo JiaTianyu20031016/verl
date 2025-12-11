@@ -2253,15 +2253,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
-        # # 也为 reward mesh 注册收集信息（供 compute_rm_score 使用）
-        # if self.ulysses_device_mesh is not None:
-        #     is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
-        #     self._register_dispatch_collect_info(
-        #         "reward", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
-        #     )
-        # else:
-        #     self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
-
         # 与原类相同的 LoRA / offload / use_orig_params 标记
         self.use_orig_params = self.config.actor.fsdp_config.get("use_orig_params", False)
         self._is_offload_param = self.config.actor.fsdp_config.get("param_offload", False)
@@ -2291,6 +2282,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             assert (
                 self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0
             ), f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
+            
 
         # rollout log_prob 归一化（需要用于 compute_log_prob 逻辑）
         if self.config.rollout.log_prob_micro_batch_size is not None:
@@ -2865,6 +2857,8 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             loop.run_until_complete(self.trainer_mode())
 
     async def rollout_mode(self):
+
+        # breakpoint()
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
 
