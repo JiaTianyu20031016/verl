@@ -2130,7 +2130,7 @@ class RayDualPPOTrainer:
                 'role': 'assistant',
                 'content': item['answer']
             }]
-            for item in batch.non_tensor_batch['extra_info']
+            for item in judge_batch_ref.non_tensor_batch['extra_info']
         ])
         judge_batch_ref = self.actor_rollout_wg._build_judge_inputs(judge_batch_ref)
         judge_batch_ref.pop(non_tensor_batch_keys=['raw_response'])
@@ -2231,8 +2231,8 @@ class RayDualPPOTrainer:
         if not is_critic_warmup:
             reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
             batch = batch.union(reward_tensor) 
-            rule_based_reward_tensor = self.rm_wg.compute_rm_score(batch)
-            batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor.batch['token_level_scores']
+            rule_based_reward_tensor = self.reward_fn(batch, return_dict=False)
+            batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor
             
         reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_loser)
         judge_batch_loser = judge_batch_loser.union(reward_tensor) 
