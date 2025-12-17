@@ -2762,7 +2762,8 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         self.current_adapter = name
         try:
             if name == "None":
-                self.actor_module_fsdp.set_adapter([])
+                # TODO: this is only a temporary solution for critic-warmup; need to properly handle no-adapter case
+                self.actor_module_fsdp.set_adapter(['actor2'])
             elif name == "shared":
                 self.actor_module_fsdp.set_adapter(['shared'])
             else:
@@ -2870,26 +2871,25 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
         if hasattr(peft_model, "peft_config"):  # LoRA
+            # there may be multiple lora adapters activated simultaneously.
+            # iteratively collect LoRA params from each active adapter
+            # and merge them as the final params to be sent to rollout engine.
+            lora_param_list = []
+            lora_config_list = []
+            for adapter_name in peft_model.active_adapters:
+                peft_config = peft_model.peft_config.get(adapter_name, None)
+                params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=self.base_sync_done,
+                    adapter_name=adapter_name,
+                )
+                lora_param_list.append(params)
+                lora_config_list.append(peft_config)
+            # merge LoRA params from all active adapters
+            params, peft_config = merge_lora_adapters(lora_param_list, lora_config_list)
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
-            else:
-                # there may be multiple lora adapters activated simultaneously.
-                # iteratively collect LoRA params from each active adapter
-                # and merge them as the final params to be sent to rollout engine.
-                lora_param_list = []
-                lora_config_list = []
-                for adapter_name in peft_model.active_adapters:
-                    peft_config = peft_model.peft_config.get(adapter_name, None)
-                    params = collect_lora_params(
-                        module=self.actor_module_fsdp,
-                        layered_summon=self.config.rollout.get("layered_summon", False),
-                        base_sync_done=self.base_sync_done,
-                        adapter_name=adapter_name,
-                    )
-                    lora_param_list.append(params)
-                    lora_config_list.append(peft_config)
-                # merge LoRA params from all active adapters
-                params, peft_config = merge_lora_adapters(lora_param_list, lora_config_list)
         else:
             params = self.actor_module_fsdp.state_dict()
         

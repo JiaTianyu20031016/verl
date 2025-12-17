@@ -731,9 +731,9 @@ def merge_lora_adapters(
 
     assert len(lora_param_list) == len(lora_config_list), "Length of lora_param_list and lora_config_list must be the same."
     if len(lora_param_list) == 0:
-        return {}
+        return None, None
     if len(lora_param_list) == 1:
-        return lora_param_list[0]
+        return lora_param_list[0], lora_config_list[0]
 
     # 1) 统计所有模块（prefix）的并集，以及每个模块是 embedding 还是 linear 命名
     module_kinds: dict[str, dict] = {}
