@@ -2045,13 +2045,14 @@ class RayDualPPOTrainer:
 
     @contextmanager
     def _get_iteration_list(self, 
-                        batch: DataProto, 
-                        judge_batch_loser: DataProto, 
-                        judge_batch_ref: DataProto, 
+                        batch_dict: dict,
                         metrics: dict,
                         HALF: bool):
         is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
         
+        batch = batch_dict['batch']
+        judge_batch_loser = batch_dict['judge_batch_loser']
+        judge_batch_ref = batch_dict['judge_batch_ref']
         ################### branch ####################
         if not HALF:
             batch_list = [judge_batch_loser, judge_batch_ref, batch] \
@@ -2073,6 +2074,9 @@ class RayDualPPOTrainer:
                 judge_batch_loser, judge_batch_ref = concat_batch.chunk(chunks=2)
                 metrics['critic_for_actor'].update(concat_metrics)
                 metrics['critic_for_ref'].update(concat_metrics)
+            batch_dict['batch'] = batch
+            batch_dict['judge_batch_loser'] = judge_batch_loser
+            batch_dict['judge_batch_ref'] = judge_batch_ref
 
 
     def _rollout_phase(self, batch: DataProto, metrics: dict, timing_raw: dict, HALF: bool) -> tuple[DataProto, DataProto, DataProto]:
@@ -2214,14 +2218,15 @@ class RayDualPPOTrainer:
 
 
     def _reward_phase(self, 
-                      batch: DataProto, 
-                      judge_batch_loser: DataProto, 
-                      judge_batch_ref: DataProto,
-                      metrics: dict, timing_raw: dict, HALF: bool)-> tuple[DataProto, DataProto, DataProto]:
+                      batch_dict: dict,
+                      metrics: dict, timing_raw: dict, HALF: bool):
         
         is_last_step = self.global_steps >= self.total_training_steps
         is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
-        
+        batch = batch_dict['batch']
+        judge_batch_loser = batch_dict['judge_batch_loser']
+        judge_batch_ref = batch_dict['judge_batch_ref']
+
         # compute critic model score for actor responses
         if not is_critic_warmup:
             reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
@@ -2237,20 +2242,16 @@ class RayDualPPOTrainer:
 
         compute_GAN_like_reward(judge_batch_loser, judge_batch_ref)
 
-        return batch, judge_batch_loser, judge_batch_ref
-
 
     def _log_prob_phase(self, 
-                        batch: DataProto,
-                        judge_batch_loser: DataProto, 
-                        judge_batch_ref: DataProto, 
-                        metrics: dict, timing_raw: dict, HALF: bool) -> tuple[DataProto, DataProto, DataProto]:
+                        batch_dict: dict,
+                        metrics: dict, timing_raw: dict, HALF: bool):
         
-
-        batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-        judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        with self._get_iteration_list(batch, judge_batch_loser, judge_batch_ref, metrics, HALF) as iter_list:
+        batch = batch_dict['batch']
+        judge_batch_loser = batch_dict['judge_batch_loser']
+        judge_batch_ref = batch_dict['judge_batch_ref']
+        
+        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
                 # Operating Mode Selection:
                 # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2296,19 +2297,16 @@ class RayDualPPOTrainer:
                             ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch_)
                         batch_ = batch_.union(ref_log_prob)
 
-        return batch, judge_batch_loser, judge_batch_ref
-
     
     def _adv_phase(self, 
-                   batch: DataProto, 
-                   judge_batch_loser: DataProto, 
-                   judge_batch_ref: DataProto, 
-                   metrics: dict, timing_raw: dict, HALF: bool) -> tuple[DataProto, DataProto, DataProto]:
+                   batch_dict: dict,
+                   metrics: dict, timing_raw: dict, HALF: bool):
 
-        batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-        judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        with self._get_iteration_list(batch, judge_batch_loser, judge_batch_ref, metrics, HALF) as iter_list:
+        batch = batch_dict['batch']
+        judge_batch_loser = batch_dict['judge_batch_loser']
+        judge_batch_ref = batch_dict['judge_batch_ref']
+        
+        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
                     # compute rewards. apply_kl_penalty if available
                     if self.config.algorithm.use_kl_in_reward:
@@ -2351,20 +2349,17 @@ class RayDualPPOTrainer:
                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         config=self.config.algorithm,
                     )
-        
-        return batch, judge_batch_loser, judge_batch_ref
 
 
     def _update_phase(self, 
-                      batch: DataProto, 
-                      judge_batch_loser: DataProto,
-                      judge_batch_ref: DataProto,
-                      metrics: dict, timing_raw: dict, HALF: bool) -> tuple[DataProto, DataProto, DataProto]:
+                      batch_dict: dict,
+                      metrics: dict, timing_raw: dict, HALF: bool):
 
-        batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-        judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-        with self._get_iteration_list(batch, judge_batch_loser, judge_batch_ref, metrics, HALF) as iter_list:
+        batch = batch_dict['batch']
+        judge_batch_loser = batch_dict['judge_batch_loser']
+        judge_batch_ref = batch_dict['judge_batch_ref']
+        
+        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
                 batch_.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                 batch_.meta_info["global_token_num"] = torch.sum(batch_.batch["attention_mask"], dim=-1).tolist()
@@ -2477,22 +2472,26 @@ class RayDualPPOTrainer:
                         if self.config.trainer.balance_batch:
                             self._balance_batch(batch_, metrics=metrics_)
 
+                    batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
+                    judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
+                    judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
+                    batch_dict = {
+                        'batch': batch,
+                        'judge_batch_loser': judge_batch_loser,
+                        'judge_batch_ref': judge_batch_ref
+                    }
                     # 2) Reward phase: compute rewards using reward model   
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        batch, judge_batch_loser, judge_batch_ref = self._reward_phase(
-                            batch, 
-                            judge_batch_loser, 
-                            judge_batch_ref, 
+                        self._reward_phase(
+                            batch_dict, 
                             metrics, 
                             timing_raw, 
                             HALF=HALF
                         )
 
                     # 3) Log prob phase: compute log probs and values
-                    batch, judge_batch_loser, judge_batch_ref = self._log_prob_phase(
-                        batch, 
-                        judge_batch_loser, 
-                        judge_batch_ref, 
+                    self._log_prob_phase(
+                        batch_dict, 
                         metrics, 
                         timing_raw, 
                         HALF=HALF
@@ -2500,10 +2499,8 @@ class RayDualPPOTrainer:
 
                     # 4) Advantage phase: compute advantages
                     with marked_timer("adv", timing_raw, color="brown"):
-                        batch, judge_batch_loser, judge_batch_ref = self._adv_phase(
-                            batch, 
-                            judge_batch_loser, 
-                            judge_batch_ref, 
+                        self._adv_phase(
+                            batch_dict, 
                             metrics, 
                             timing_raw, 
                             HALF=HALF
@@ -2511,10 +2508,8 @@ class RayDualPPOTrainer:
 
                     # 5) Update phase: update actor model
                     with marked_timer("update_actor", timing_raw, color="red"):
-                        batch, judge_batch_loser, judge_batch_ref = self._update_phase(
-                            batch, 
-                            judge_batch_loser, 
-                            judge_batch_ref, 
+                        self._update_phase(
+                            batch_dict, 
                             metrics, 
                             timing_raw, 
                             HALF=HALF
