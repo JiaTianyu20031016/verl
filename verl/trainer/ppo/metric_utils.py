@@ -103,6 +103,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    rule_based_sequence_score = batch.batch.get("rule_based_token_level_scores", None)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -131,6 +132,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
     reward_max = torch.max(non_aborted_sequence_reward).detach().item()
     reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+
+    if rule_based_sequence_score is not None:
+        rule_based_sequence_score = rule_based_sequence_score[non_aborted_mask]
+        rule_based_score_mean = torch.mean(rule_based_sequence_score).detach().item()
+        rule_based_score_max = torch.max(rule_based_sequence_score).detach().item()
+        rule_based_score_min = torch.min(rule_based_sequence_score).detach().item()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -165,6 +172,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        **(
+            {
+                # rule-based score
+                "critic/rule_based_score/mean": rule_based_score_mean,
+                "critic/rule_based_score/max": rule_based_score_max,
+                "critic/rule_based_score/min": rule_based_score_min,
+            }
+            if rule_based_sequence_score is not None
+            else {}
+        ),
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),

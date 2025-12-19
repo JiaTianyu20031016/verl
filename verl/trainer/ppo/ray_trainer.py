@@ -26,7 +26,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import ray
@@ -1660,7 +1660,7 @@ class RayDualPPOTrainer:
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             # use actor2 for validation
-            test_gen_batch_padded.meta_info['active_adapter'] = 'actor2'
+            test_gen_batch_padded.meta_info['active_adapter'] = 'actor2' if self.global_steps >= self.config.trainer.critic_warmup else 'actor1'
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -2006,11 +2006,17 @@ class RayDualPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch["attention_mask"]
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False, mode: Literal['sequence', 'response']='sequence'):
+        """
+        Reorder the data on single controller such that each dp rank gets similar total tokens.
+
+        Returns:
+            torch.Tensor: reverse_index (same dtype/device as global_idx) that can be used with
+            ``batch.reorder(reverse_index)`` to restore the original order.
+        """
+        attention_mask = batch.batch["attention_mask"] if mode == 'sequence' else batch.batch["response_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
+        global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
         world_size = self.actor_rollout_wg.world_size
         if keep_minibatch:
@@ -2037,11 +2043,24 @@ class RayDualPPOTrainer:
             global_partition_lst[idx] = ordered_partition
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        # Build inverse permutation so caller can restore original order if needed.
+        reverse_index = torch.empty_like(global_idx)
+        reverse_index[global_idx] = torch.arange(global_idx.numel(), device=global_idx.device)
+
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
-        metrics.update(global_balance_stats)
+        # metrics.update(global_balance_stats)
+        return reverse_index
+
+    @contextmanager
+    def _balance_batch_context(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False, mode: Literal['sequence', 'response']='sequence'):
+        reverse_index = self._balance_batch(batch, metrics, logging_prefix, keep_minibatch, mode)
+        try:
+            yield
+        finally:
+            batch.reorder(reverse_index)
 
     @contextmanager
     def _get_iteration_list(self, 
@@ -2120,6 +2139,13 @@ class RayDualPPOTrainer:
 
         # 2) Build LLM-as-a-Judge prompts from (prompt, answer) pairs
         # for each <prompt, LLM-genrated answer>, we build a judge prompt. the number of such pairs is batch_size * rollout.n
+        batch.non_tensor_batch['raw_prompt'] = np.asarray([
+            [{
+                'role': 'user',
+                'content': item['question']
+            }]
+            for item in batch.non_tensor_batch['extra_info']
+        ])
         judge_batch = self.actor_rollout_wg._build_judge_inputs(batch)
         # pick one answer per prompt to build judge prompt, and then repeat for rollout.n times.
         judge_batch_loser = judge_batch.slice(step=self.config.actor_rollout_ref.rollout.n)    
@@ -2134,7 +2160,6 @@ class RayDualPPOTrainer:
         ])
         judge_batch_ref = self.actor_rollout_wg._build_judge_inputs(judge_batch_ref)
         judge_batch_ref.pop(non_tensor_batch_keys=['raw_response'])
-
 
         # 3) LLM as a judge with actor1 on judge prompts
         with marked_timer("gen: LLM-as-a-judge for actor", timing_raw, color="red"):
@@ -2236,9 +2261,11 @@ class RayDualPPOTrainer:
             
         reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_loser)
         judge_batch_loser = judge_batch_loser.union(reward_tensor) 
+        judge_batch_loser.batch['rule_based_token_level_scores'] = judge_batch_loser.batch['token_level_scores']
 
         reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_ref)
         judge_batch_ref = judge_batch_ref.union(reward_tensor)   
+        judge_batch_ref.batch['rule_based_token_level_scores'] = judge_batch_ref.batch['token_level_scores']
 
         compute_GAN_like_reward(judge_batch_loser, judge_batch_ref)
 
@@ -2253,49 +2280,50 @@ class RayDualPPOTrainer:
         
         with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
-                # Operating Mode Selection:
-                # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                    from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+                with self._balance_batch_context(batch_, metrics_):
+                    # Operating Mode Selection:
+                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
 
-                    apply_rollout_correction(
-                        batch=batch_,
-                        rollout_corr_config=rollout_corr_config,
-                        policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                    )
-                else:  # Recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch_)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch_.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(
-                            loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                        apply_rollout_correction(
+                            batch=batch_,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics_.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch_ = batch_.union(old_log_prob)
-                        if "rollout_log_probs" in batch_.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                    else:  # Recompute old_log_probs
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch_)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch_.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics_.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch_ = batch_.union(old_log_prob)
+                            if "rollout_log_probs" in batch_.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics_.update(calculate_debug_metrics(batch_))
+                                metrics_.update(calculate_debug_metrics(batch_))
 
-                assert "old_log_probs" in batch_.batch, f'"old_log_prob" not in {batch_.batch.keys()=}'
+                    assert "old_log_probs" in batch_.batch, f'"old_log_prob" not in {batch_.batch.keys()=}'
 
-                if self.use_reference_policy:
-                    # compute reference log_prob
-                    with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                        if not self.ref_in_actor:
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch_)
-                        else:
-                            ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch_)
-                        batch_ = batch_.union(ref_log_prob)
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch_)
+                            else:
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch_)
+                            batch_ = batch_.union(ref_log_prob)
 
     
     def _adv_phase(self, 
@@ -2308,6 +2336,7 @@ class RayDualPPOTrainer:
         
         with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
+                with self._balance_batch_context(batch_, metrics_):
                     # compute rewards. apply_kl_penalty if available
                     if self.config.algorithm.use_kl_in_reward:
                         batch_, kl_metrics = apply_kl_penalty(
@@ -2361,11 +2390,12 @@ class RayDualPPOTrainer:
         
         with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
             for batch_, metrics_ in iter_list:
-                batch_.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                batch_.meta_info["global_token_num"] = torch.sum(batch_.batch["attention_mask"], dim=-1).tolist()
-                actor_output = self.actor_rollout_wg.update_actor(batch_)
-                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                metrics_.update(actor_output_metrics)
+                with self._balance_batch_context(batch_, metrics_):
+                    batch_.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                    batch_.meta_info["global_token_num"] = torch.sum(batch_.batch["attention_mask"], dim=-1).tolist()
+                    actor_output = self.actor_rollout_wg.update_actor(batch_)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                    metrics_.update(actor_output_metrics)
 
         judge_batch_loser.meta_info["global_token_num"] = torch.sum(judge_batch_loser.batch["attention_mask"], dim=-1).tolist()
         judge_batch_ref.meta_info["global_token_num"] = torch.sum(judge_batch_ref.batch["attention_mask"], dim=-1).tolist()
@@ -2382,6 +2412,8 @@ class RayDualPPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
+
+        import json
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -2425,6 +2457,7 @@ class RayDualPPOTrainer:
         )
         next_step_profile = False
 
+        judge_text_record = []
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {
@@ -2448,77 +2481,86 @@ class RayDualPPOTrainer:
                 )
 
                 ##################### STEP START #####################
-                breakpoint()
                 is_last_step = self.global_steps >= self.total_training_steps
                 is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
-                with marked_timer("step", timing_raw):
-                    # 1) Rollout phase: generate answers and judge responses
-                    batch, judge_batch_loser, judge_batch_ref = self._rollout_phase(
-                        batch, metrics, timing_raw, HALF=HALF
-                    )
+                try:
+                    with marked_timer("step", timing_raw):
+                        # 1) Rollout phase: generate answers and judge responses
+                        batch, judge_batch_loser, judge_batch_ref = self._rollout_phase(
+                            batch, metrics, timing_raw, HALF=HALF
+                        )
 
-                    for batch_, metrics_ in [
-                        (batch, metrics["actor"]), 
-                        (judge_batch_loser, metrics["critic_for_actor"]), 
-                        (judge_batch_ref, metrics["critic_for_ref"])
-                    ]:
-                        if "response_mask" not in batch_.batch.keys():
-                            batch_.batch["response_mask"] = compute_response_mask(batch_)
-        
-                        # Balance the number of valid tokens across DP ranks.
-                        # NOTE: This usually changes the order of data in the `batch`,
-                        # which won't affect the advantage calculation (since it's based on uid),
-                        # but might affect the loss calculation (due to the change of mini-batching).                        
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch_, metrics=metrics_)
+                        for batch_, metrics_ in [
+                            (batch, metrics["actor"]), 
+                            (judge_batch_loser, metrics["critic_for_actor"]), 
+                            (judge_batch_ref, metrics["critic_for_ref"])
+                        ]:
+                            if "response_mask" not in batch_.batch.keys():
+                                batch_.batch["response_mask"] = compute_response_mask(batch_)
+            
+                            # Balance the number of valid tokens across DP ranks.
+                            # NOTE: This usually changes the order of data in the `batch`,
+                            # which won't affect the advantage calculation (since it's based on uid),
+                            # but might affect the loss calculation (due to the change of mini-batching).                        
+                            # if self.config.trainer.balance_batch:
+                            #    self._balance_batch(batch_, metrics=metrics_, mode='sequence')
 
-                    batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-                    judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-                    judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-                    batch_dict = {
-                        'batch': batch,
-                        'judge_batch_loser': judge_batch_loser,
-                        'judge_batch_ref': judge_batch_ref
-                    }
-                    # 2) Reward phase: compute rewards using reward model   
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        self._reward_phase(
+                        batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
+                        judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
+                        judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
+                        batch_dict = {
+                            'batch': batch,
+                            'judge_batch_loser': judge_batch_loser,
+                            'judge_batch_ref': judge_batch_ref
+                        }
+                        # 2) Reward phase: compute rewards using reward model   
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            self._reward_phase(
+                                batch_dict, 
+                                metrics, 
+                                timing_raw, 
+                                HALF=HALF
+                            )
+
+                        # 3) Log prob phase: compute log probs and values
+                        self._log_prob_phase(
                             batch_dict, 
                             metrics, 
                             timing_raw, 
                             HALF=HALF
                         )
 
-                    # 3) Log prob phase: compute log probs and values
-                    self._log_prob_phase(
-                        batch_dict, 
-                        metrics, 
-                        timing_raw, 
-                        HALF=HALF
-                    )
+                        # 4) Advantage phase: compute advantages
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            self._adv_phase(
+                                batch_dict, 
+                                metrics, 
+                                timing_raw, 
+                                HALF=HALF
+                            )
 
-                    # 4) Advantage phase: compute advantages
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        self._adv_phase(
-                            batch_dict, 
-                            metrics, 
-                            timing_raw, 
-                            HALF=HALF
-                        )
+                        # 5) Update phase: update actor model
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            self._update_phase(
+                                batch_dict, 
+                                metrics, 
+                                timing_raw, 
+                                HALF=HALF
+                            )
+                except Exception as e:
+                    if "out of memory" in str(e):
+                        print(f"Warning: Caught out of memory error at global step {self.global_steps}, skipping this batch.")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
+                ##################### STEP END #####################
 
-                    # 5) Update phase: update actor model
-                    with marked_timer("update_actor", timing_raw, color="red"):
-                        self._update_phase(
-                            batch_dict, 
-                            metrics, 
-                            timing_raw, 
-                            HALF=HALF
-                        )
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, None, timing_raw, rollout_data_dir)
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, None, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
@@ -2571,7 +2613,7 @@ class RayDualPPOTrainer:
 
 
                 # collect metrics
-                with self._get_iteration_list(batch, judge_batch_loser, judge_batch_ref, metrics, HALF=False) as iter_list:
+                with self._get_iteration_list(batch_dict, metrics, HALF=False) as iter_list:
                     for batch_, metrics_ in iter_list:
                         metrics_.update(compute_data_metrics(batch=batch_, use_critic=self.use_critic))
                         metrics_.update(compute_timing_metrics(batch=batch_, timing_raw=timing_raw))
@@ -2580,11 +2622,11 @@ class RayDualPPOTrainer:
                         metrics_.update(compute_throughout_metrics(batch=batch_, timing_raw=timing_raw, n_gpus=n_gpus))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
+                flattened_metrics = {}
                 for prefix, metrics_ in metrics.items():
                     for key, value in metrics_.items():
-                        metrics[f"{prefix}/{key}"] = value
-                    # remove the nested dict
-                    metrics.pop(prefix)
+                        flattened_metrics[f"{prefix}//{key}"] = value
+                metrics = flattened_metrics
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
@@ -2620,3 +2662,38 @@ class RayDualPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+                # breakpoint()            
+                os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+                with open(os.path.join(self.config.trainer.default_local_dir, "judge_text_record_loser.jsonl"), "a") as f:
+                    for raw_judge_prompt, judge_response in zip(
+                                judge_batch_loser.non_tensor_batch.get("raw_judge_prompt", np.array([])).tolist(),
+                                judge_batch_loser.non_tensor_batch.get("raw_judge_texts", np.array([])).tolist()
+                            ):
+                        f.write(
+                            json.dumps
+                                (
+                                    {
+                                        "raw_judge_prompt": raw_judge_prompt,
+                                        "judge_response": judge_response,
+                                    }, 
+                                    ensure_ascii=False
+                                ) + "\n"
+                            )
+
+                with open(os.path.join(self.config.trainer.default_local_dir, "judge_text_record_ref.jsonl"), "a") as f:
+                    for raw_judge_prompt, judge_response in zip(
+                                judge_batch_ref.non_tensor_batch.get("raw_judge_prompt", np.array([])).tolist(),
+                                judge_batch_ref.non_tensor_batch.get("raw_judge_texts", np.array([])).tolist()
+                            ):
+                        f.write(
+                            json.dumps
+                                (
+                                    {
+                                        "raw_judge_prompt": raw_judge_prompt,
+                                        "judge_response": judge_response,
+                                    }, 
+                                    ensure_ascii=False
+                                ) + "\n"
+                            )
+                        

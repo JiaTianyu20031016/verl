@@ -2347,7 +2347,8 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     def _get_effective_cfg(self, adapter_name: str, cfg_name: str):
         """Return rollout config; use judge.rollout if adapter is actor1 and available."""
-        if adapter_name in ['actor2', 'None', 'shared']:
+        adapter_name = adapter_name.lower()
+        if adapter_name in ['actor2', 'none', 'shared']:
             return self.config.get(cfg_name, None)
         elif adapter_name == "actor1":
             if hasattr(self.config, "judge") and hasattr(self.config.judge, cfg_name):
@@ -2757,11 +2758,12 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     # ------------- Actor interfaces -------------
     def do_switch_adapter(self, name: str):
-        if name not in ("actor1", "actor2", "shared", "None"):
+        name = name.lower()
+        if name not in ("actor1", "actor2", "shared", "none"):
             raise ValueError(f"Unknown adapter name '{name}'")
         self.current_adapter = name
         try:
-            if name == "None":
+            if name == "none":
                 # TODO: this is only a temporary solution for critic-warmup; need to properly handle no-adapter case
                 self.actor_module_fsdp.set_adapter(['actor2'])
             elif name == "shared":
@@ -2826,7 +2828,6 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             config=rollout_config, 
             model_config=model_config, 
             device_mesh=rollout_device_mesh,
-            max_loras=2,
             max_lora_rank=2*self.config.model.get("lora_rank", 0),
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
@@ -3145,7 +3146,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     
 
     # ------------- RewardModel interfaces (actor1 as judge) -------------
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def _build_judge_inputs(self, data: DataProto) -> dict:
         """Return tokenized judge inputs dict aligned with RLHFDataset.__getitem__.
 
@@ -3221,12 +3222,12 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
                 )
 
             messages = [{"role": "user", "content": judge_prompt}]
-            judge_prompt = dst_tokenizer.apply_chat_template(
+            judge_message = dst_tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             )
 
             # Tokenize
-            model_inputs = dst_tokenizer(judge_prompt, return_tensors="pt", add_special_tokens=False)
+            model_inputs = dst_tokenizer(judge_message, return_tensors="pt", add_special_tokens=False)
             j_input_ids = model_inputs.pop("input_ids")
             j_attention_mask = model_inputs.pop("attention_mask")
 
@@ -3248,7 +3249,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             outputs["input_ids"].append(j_input_ids[0])
             outputs["attention_mask"].append(j_attention_mask[0])
             outputs["position_ids"].append(j_position_ids[0])
-            outputs["raw_prompt"].append(messages)
+            outputs["raw_prompt"].append(judge_prompt)
             
         outputs_batch = deepcopy(data)
         outputs_batch.batch["input_ids"] = torch.stack(outputs["input_ids"], dim=0)
@@ -3259,7 +3260,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         return outputs_batch
 
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="orange")
     def compute_rm_score(self, data: DataProto):
         # 从 data.batch['judge_response'] 解码并解析评分；失败样本标注 reward valid=False
