@@ -2113,7 +2113,7 @@ class RayDualPPOTrainer:
                 gen_batch_output = gen_batch_output.slice(step=self.config.actor_rollout_ref.rollout.n)
             
             # Hint to worker to use actor2 adapter during generation
-            gen_batch_output.meta_info["active_adapter"] = "actor2" if not is_critic_warmup else "None"
+            gen_batch_output.meta_info["active_adapter"] = "actor2"
             if not self.async_rollout_mode:
                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
             else:
@@ -2166,7 +2166,7 @@ class RayDualPPOTrainer:
             if not is_critic_warmup:   
                 gen_judge_batch = self._get_gen_batch(judge_batch)
                 gen_judge_batch.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch.meta_info["active_adapter"] = "actor1"
+                gen_judge_batch.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
                 if not self.async_rollout_mode:  
                     gen_judge_batch = self.actor_rollout_wg.generate_sequences(gen_judge_batch)
                 else:
@@ -2191,9 +2191,9 @@ class RayDualPPOTrainer:
                 )
 
                 gen_judge_batch_loser_output.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch_loser_output.meta_info["active_adapter"] = "actor1"
+                gen_judge_batch_loser_output.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
                 gen_judge_batch_ref_output.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch_ref_output.meta_info["active_adapter"] = "actor1"
+                gen_judge_batch_ref_output.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
                 
                 if not self.async_rollout_mode:
                     gen_judge_batch_loser_output = self.actor_rollout_wg.generate_sequences(gen_judge_batch_loser_output)
@@ -2216,7 +2216,7 @@ class RayDualPPOTrainer:
                 )
                 concat_batch = DataProto.concat([gen_judge_batch_loser_output, gen_judge_batch_ref_output])
                 concat_batch.meta_info["global_steps"] = self.global_steps
-                concat_batch.meta_info["active_adapter"] = "actor1"
+                concat_batch.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
                 if not self.async_rollout_mode:
                     concat_batch = self.actor_rollout_wg.generate_sequences(concat_batch)
                 else:
@@ -2258,7 +2258,22 @@ class RayDualPPOTrainer:
             batch = batch.union(reward_tensor) 
             rule_based_reward_tensor = self.reward_fn(batch, return_dict=False)
             batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor
+
+            # some metrics for debugging
+            scores = batch.batch['token_level_scores'].sum(dim=-1)
+            scores_var = torch.var(scores.view((-1, self.config.actor_rollout_ref.rollout.n)), dim=-1).mean().item()
+            metrics['actor']['critic/score/var'] = scores_var
+            rule_based_scores = batch.batch['rule_based_token_level_scores'].sum(dim=-1)
+            def spearman_corr(x, y):
+                x_rank = torch.argsort(torch.argsort(x))
+                y_rank = torch.argsort(torch.argsort(y))
+                return torch.corrcoef(torch.stack([x_rank.float(), y_rank.float()]))[0, 1]
+            consistency = spearman_corr(scores, rule_based_scores).item()
+            metrics['actor']['critic/score/consistency_to_rule'] = consistency
             
+            # mix rule-based reward into critic score
+            batch.batch['token_level_scores'] += batch.batch['rule_based_token_level_scores']
+
         reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_loser)
         judge_batch_loser = judge_batch_loser.union(reward_tensor) 
         judge_batch_loser.batch['rule_based_token_level_scores'] = judge_batch_loser.batch['token_level_scores']
@@ -2480,6 +2495,7 @@ class RayDualPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # breakpoint()
                 ##################### STEP START #####################
                 is_last_step = self.global_steps >= self.total_training_steps
                 is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
@@ -2506,8 +2522,8 @@ class RayDualPPOTrainer:
                             #    self._balance_batch(batch_, metrics=metrics_, mode='sequence')
 
                         batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-                        judge_batch_loser.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
-                        judge_batch_ref.meta_info['active_adapter'] = 'actor1'  # set active adapter back to actor1
+                        judge_batch_loser.meta_info['active_adapter'] = 'actor1' if not is_critic_warmup else 'actor1-only'  # set active adapter back to actor1
+                        judge_batch_ref.meta_info['active_adapter'] = 'actor1' if not is_critic_warmup else 'actor1-only'  # set active adapter back to actor1
                         batch_dict = {
                             'batch': batch,
                             'judge_batch_loser': judge_batch_loser,
@@ -2521,6 +2537,9 @@ class RayDualPPOTrainer:
                                 timing_raw, 
                                 HALF=HALF
                             )
+
+                        #breakpoint()
+
 
                         # 3) Log prob phase: compute log probs and values
                         self._log_prob_phase(

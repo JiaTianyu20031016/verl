@@ -39,6 +39,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from contextlib import contextmanager
 from copy import deepcopy
+from verl.prompt import PROMPT_PER_STEP, PROMPT_AS_WHOLE
 
 try:
     # for torch 2.5+
@@ -2295,24 +2296,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
         # Judge 配置（供 RM 打分）
         self.judge_template = self.config.get(
-            "judge_prompt_template",
-            (
-                '''
-                You are an impartial mathematical reasoning judge. Given a math problem and a chain-of-thought (CoT), 
-                evaluate the correctness of the reasoning.\n\n
-                Instructions:\n
-                - First, concisely analyze the reasoning step-by-step, judging correctness and pointing out errors.\n
-                - Then give an overall integer score from 0 to 10 based on your analysis. \n
-                - If the CoT seems incomplete or truncated (e.g., ends abruptly, or does not contain the final answer wrapped in \\box{{...}} in the CoT), directly assign a score of 0. \n
-                - If the final answer of the reasoning is correct, assign a score between 6 and 10. The specific score depends on the correctness and completeness of the intermediate reasoning steps. If there are flaws in intermediate reasoning steps, make deductions from the full score of 10 as appropriate.\n
-                - If the final answer of the reasoning is incorrect, assign a score between 0 and 5. The specific score depends on the correctness and completeness of the intermediate reasoning steps. If there are partially correct intermediate reasoning steps, add points to the base score of 0 as appropriate. Assign a score of 0 to CoT with fundamental errors or clearly incorrect. \n\n
-                Format requirements:\n
-                - Wrap your analysis in <think>...</think>.\n
-                - Wrap the final integer score in <score>...</score>.\n
-                - Your output shoule look like <think>your analysis here</think><score>your score here</score>\n\n
-                [Problem]\n{prompt}\n\n[Chain-of-Thought]\n{response}\n\n[Your Judgement]\n
-                '''
-            ),
+            "judge_prompt_template", PROMPT_PER_STEP
         )
         self.judge_template_with_ref = self.config.get(
             "judge_prompt_template_with_ref",
@@ -2333,13 +2317,11 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
             ),
         )
         self.score_pattern = re.compile(
-            self.config.get("judge_score_pattern", r"<score>\s*(\d+)\s*</score>"), flags=re.IGNORECASE
+            self.config.get("judge_score_pattern", r"<score>\s*(\d+(?:\.\d+)?)\s*</score>"), flags=re.IGNORECASE
         )
         self.score_min = float(self.config.get("judge_score_min", 0.0))
-        self.score_max = float(self.config.get("judge_score_max", 10.0))
+        self.score_max = float(self.config.get("judge_score_max", 1.0))
         self.normalize_score = bool(self.config.get("judge_normalize", False))
-        self.max_new_tokens = int(self.config.get("judge_max_new_tokens", 64))
-        self.temperature = float(self.config.get("judge_temperature", 0.1))
 
         # 当前适配器：actor1/actor2
         self.current_adapter = "actor1"
@@ -2347,16 +2329,17 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
     def _get_effective_cfg(self, adapter_name: str, cfg_name: str):
         """Return rollout config; use judge.rollout if adapter is actor1 and available."""
-        adapter_name = adapter_name.lower()
-        if adapter_name in ['actor2', 'none', 'shared']:
-            return self.config.get(cfg_name, None)
-        elif adapter_name == "actor1":
-            if hasattr(self.config, "judge") and hasattr(self.config.judge, cfg_name):
-                return getattr(self.config.judge, cfg_name)
-            else:
-                return self.config.get(cfg_name, None)
-        else:
-            raise ValueError(f"Unknown adapter name {adapter_name}")
+        return self.config.get(cfg_name, None)
+        # adapter_name = adapter_name.lower()
+        # if adapter_name in ['actor2', 'none', 'shared']:
+        #     return self.config.get(cfg_name, None)
+        # elif adapter_name == "actor1":
+        #     if hasattr(self.config, "judge") and hasattr(self.config.judge, cfg_name):
+        #         return getattr(self.config.judge, cfg_name)
+        #     else:
+        #         return self.config.get(cfg_name, None)
+        # else:
+        #     raise ValueError(f"Unknown adapter name {adapter_name}")
 
 
     def _build_dual_lora_actor(self):
@@ -2759,12 +2742,15 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
     # ------------- Actor interfaces -------------
     def do_switch_adapter(self, name: str):
         name = name.lower()
-        if name not in ("actor1", "actor2", "shared", "none"):
+        if name not in ("actor1", "actor2", "shared", "actor1-only", "actor2-only", "none"):
             raise ValueError(f"Unknown adapter name '{name}'")
         self.current_adapter = name
         try:
             if name == "none":
-                # TODO: this is only a temporary solution for critic-warmup; need to properly handle no-adapter case
+                raise NotImplementedError("Switching to 'none' adapter is not implemented yet.")
+            elif name == "actor1-only":
+                self.actor_module_fsdp.set_adapter(['actor1'])
+            elif name == "actor2-only":
                 self.actor_module_fsdp.set_adapter(['actor2'])
             elif name == "shared":
                 self.actor_module_fsdp.set_adapter(['shared'])
@@ -3089,12 +3075,10 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
         # 适配器选择
         active_adapter = data.meta_info.get("active_adapter", self.current_adapter)
         adapter_ctx = nullcontext()
-        if active_adapter == "None":
+        if active_adapter.lower() == "none":
             adapter_ctx = self.actor.actor_module.disable_adapter()
-        elif active_adapter in ("actor1", "actor2"):
-            adapter_ctx = self.switch_adapter(active_adapter)
         else:
-            raise ValueError(f"Unknown active_adapter '{active_adapter}'")
+            adapter_ctx = self.switch_adapter(active_adapter)
         
         eff_rollout = self._get_effective_cfg(active_adapter, "rollout")
         # 读取 log_prob 相关配置（若 judge.rollout 未定义则回退到顶层 rollout）

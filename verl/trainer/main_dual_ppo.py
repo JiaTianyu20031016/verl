@@ -75,6 +75,15 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+
+        # Specify Ray temporary directory for local cluster files
+        tmp_dir = "/data2/jty/ray/tmp"
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+        except Exception:
+            pass
+        with open_dict(ray_init_kwargs):
+            ray_init_kwargs["_temp_dir"] = tmp_dir
         print(f"ray init kwargs: {ray_init_kwargs}")
         
         # for using python debugger, we need to set local_mode=True
