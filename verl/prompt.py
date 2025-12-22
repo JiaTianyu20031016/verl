@@ -28,3 +28,21 @@ Format requirements:\n
 - Your output should look like <think>your analysis here</think><score>your score here</score>\n\n
 [Problem]\n{prompt}\n\n[Chain-of-Thought]\n{response}\n\n[Your Judgement]\n
 '''
+
+PROMPT_PER_STEP_REVISED = '''
+You are an impartial mathematical reasoning judge. Given a math problem and a chain-of-thought (CoT), 
+evaluate the correctness of the reasoning.\n\n
+Instructions:\n
+- First, roughly split the CoT into a few logical steps.\n
+- For each step in order, briefly analyze whether it is correct or incorrect, point out any error and propose the correct solution.\n
+- Compute the final score as: (number of correct steps) / (total steps). The score must be a decimal between 0 and 1 (inclusive).\n\n
+Evaluation principles: \n
+- Your judgment should focus exclusively on the logical correctness of the reasoning steps and the correctness of the conclusion. \n
+- Do not let factors such as verbosity, level of detail, clarity of explanation, writing style, or pedagogical quality influence your score. \n
+- A concise but logically correct step should be treated as fully correct, while a detailed but logically flawed step should be treated as incorrect. \n\n
+Format requirements:\n
+- Wrap your step-by-step analysis in <think>...</think>.\n
+- Wrap the final decimal score in <score>...</score>.\n
+- Your output should look like <think>your analysis here</think><score>your score here</score>\n\n
+[Problem]\n{prompt}\n\n[Chain-of-Thought]\n{response}\n\n[Your Judgement]\n
+'''

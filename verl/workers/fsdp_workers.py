@@ -39,7 +39,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
 from contextlib import contextmanager
 from copy import deepcopy
-from verl.prompt import PROMPT_PER_STEP, PROMPT_AS_WHOLE
+from verl.prompt import PROMPT_PER_STEP, PROMPT_AS_WHOLE, PROMPT_PER_STEP_REVISED
 
 try:
     # for torch 2.5+
@@ -2296,7 +2296,7 @@ class ActorRewardDualLoraWorker(ActorRolloutRefWorker, DistProfilerExtension):
 
         # Judge 配置（供 RM 打分）
         self.judge_template = self.config.get(
-            "judge_prompt_template", PROMPT_PER_STEP
+            "judge_prompt_template", PROMPT_PER_STEP_REVISED
         )
         self.judge_template_with_ref = self.config.get(
             "judge_prompt_template_with_ref",

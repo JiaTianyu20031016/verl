@@ -1029,17 +1029,17 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
-
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    gen_batch = self._get_gen_batch(batch)
+
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
+
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
@@ -1220,11 +1220,11 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    
+                # Log rollout generations if enabled
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
@@ -2067,24 +2067,19 @@ class RayDualPPOTrainer:
                         batch_dict: dict,
                         metrics: dict,
                         HALF: bool):
-        is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
         
         batch = batch_dict['batch']
         judge_batch_loser = batch_dict['judge_batch_loser']
         judge_batch_ref = batch_dict['judge_batch_ref']
         ################### branch ####################
         if not HALF:
-            batch_list = [judge_batch_loser, judge_batch_ref, batch] \
-                if not is_critic_warmup \
-                else [judge_batch_loser, judge_batch_ref]
-            metrics_list = [metrics['critic_for_actor'], metrics['critic_for_ref'], metrics['actor']] \
-                if not is_critic_warmup \
-                else [metrics['critic_for_actor'], metrics['critic_for_ref']]
+            batch_list = [judge_batch_loser, judge_batch_ref, batch]
+            metrics_list = [metrics['critic_for_actor'], metrics['critic_for_ref'], metrics['actor']]
         else:
             concat_batch = DataProto.concat([judge_batch_loser, judge_batch_ref])
-            batch_list = [concat_batch, batch] if not is_critic_warmup else [concat_batch]
+            batch_list = [concat_batch, batch]
             concat_metrics = {}
-            metrics_list = [concat_metrics, metrics['actor']] if not is_critic_warmup else [concat_metrics]
+            metrics_list = [concat_metrics, metrics['actor']]
         ################### branch ####################
         try:
             yield zip(batch_list, metrics_list)
@@ -2109,9 +2104,6 @@ class RayDualPPOTrainer:
 
         # 1) Answer rollout with actor2
         with marked_timer("gen: rollout for actor", timing_raw, color="red"):  
-            if is_critic_warmup:
-                gen_batch_output = gen_batch_output.slice(step=self.config.actor_rollout_ref.rollout.n)
-            
             # Hint to worker to use actor2 adapter during generation
             gen_batch_output.meta_info["active_adapter"] = "actor2"
             if not self.async_rollout_mode:
@@ -2122,11 +2114,6 @@ class RayDualPPOTrainer:
 
             timing_raw.update(gen_batch_output.meta_info["timing"])
             gen_batch_output.meta_info.pop("timing", None)
-
-            if is_critic_warmup:
-                gen_batch_output = gen_batch_output.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
 
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             raise NotImplementedError("REMAX is not implemented in dual-ppo trainer yet")
@@ -2147,8 +2134,89 @@ class RayDualPPOTrainer:
             for item in batch.non_tensor_batch['extra_info']
         ])
         judge_batch = self.actor_rollout_wg._build_judge_inputs(batch)
+
+        # 3) LLM as a judge with actor1 on judge prompts
+        with marked_timer("gen: LLM-as-a-judge for actor", timing_raw, color="red"):
+            gen_judge_batch = self._get_gen_batch(judge_batch)
+            gen_judge_batch.meta_info["global_steps"] = self.global_steps
+            gen_judge_batch.meta_info["active_adapter"] = "actor1"
+            if not self.async_rollout_mode:  
+                gen_judge_batch = self.actor_rollout_wg.generate_sequences(gen_judge_batch)
+            else:
+                raise NotImplementedError("async rollout is not supported in dual-ppo trainer yet")
+            batch.batch['judge_responses'] = gen_judge_batch.batch['responses']
+            del gen_judge_batch, judge_batch
+
+
+        # 4) Compute rewards for actor rollout answers
+        reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
+        batch = batch.union(reward_tensor) 
+        rule_based_reward_tensor = self.reward_fn(batch, return_dict=True)
+        batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor["reward_tensor"]
+        batch.non_tensor_batch['truncated'] = ~np.asarray(rule_based_reward_tensor["reward_extra_info"]['answer_extracted'])
+
+        # some metrics for debugging
+        scores = batch.batch['token_level_scores'].sum(dim=-1)
+        scores_var = torch.var(scores.view((-1, self.config.actor_rollout_ref.rollout.n)), dim=-1).mean().item()
+        metrics['actor']['critic/score/var'] = scores_var
+        rule_based_scores = batch.batch['rule_based_token_level_scores'].sum(dim=-1)
+        def spearman_corr(x, y):
+            x_rank = torch.argsort(torch.argsort(x))
+            y_rank = torch.argsort(torch.argsort(y))
+            return torch.corrcoef(torch.stack([x_rank.float(), y_rank.float()]))[0, 1]
+        consistency = spearman_corr(scores, rule_based_scores).item()
+        metrics['actor']['critic/score/consistency_to_rule'] = consistency
+
+
+        # 5) Build LLM-as-a-Judge prompts for critique rollout
+        def select_loser(batch: DataProto, n: int, mode: Literal['random', 'worst', 'best']='random') -> DataProto:
+            scores = batch.batch['token_level_scores'].sum(-1).view(-1, n)  # (batch_size, n)
+            rule_based_scores = batch.batch['rule_based_token_level_scores'].sum(-1).view(-1, n)
+            truncated = batch.non_tensor_batch['truncated'].reshape(-1, n)  # (batch_size, n)
+            if mode == 'random':
+                return batch.slice(step=n)
+            if mode not in ['worst', 'best']:
+                raise ValueError(f"mode must be 'random', 'worst', or 'best', got {mode}")
+
+            batch_size = scores.shape[0]
+            # mask out truncated rows when selecting per prompt
+            trunc_mask = torch.as_tensor(truncated, device=scores.device)
+            selected_indices: list[int] = []
+
+            for i in range(batch_size):
+                mask_available = ~trunc_mask[i]
+                # if all truncated, fall back to using all entries
+                if not mask_available.any():
+                    mask_available = torch.ones_like(mask_available, dtype=torch.bool)
+
+                candidates_rule = rule_based_scores[i][mask_available]
+                candidates_score = scores[i][mask_available]
+                candidate_idx = torch.nonzero(mask_available, as_tuple=False).squeeze(1)
+
+                if mode == 'worst':
+                    target_rule = candidates_rule.min()
+                    tie_mask = candidates_rule == target_rule
+                    if tie_mask.sum() > 1:
+                        target_score = candidates_score[tie_mask].min()
+                        tie_mask = tie_mask & (candidates_score == target_score)
+                    chosen_local = candidate_idx[torch.nonzero(tie_mask, as_tuple=False).squeeze(1)[0]]
+                else:  # mode == 'best'
+                    target_rule = candidates_rule.max()
+                    tie_mask = candidates_rule == target_rule
+                    if tie_mask.sum() > 1:
+                        target_score = candidates_score[tie_mask].max()
+                        tie_mask = tie_mask & (candidates_score == target_score)
+                    chosen_local = candidate_idx[torch.nonzero(tie_mask, as_tuple=False).squeeze(1)[0]]
+
+                selected_indices.append(i * n + int(chosen_local))
+
+            return batch.select_idxs(torch.tensor(selected_indices, device=scores.device))
+
         # pick one answer per prompt to build judge prompt, and then repeat for rollout.n times.
-        judge_batch_loser = judge_batch.slice(step=self.config.actor_rollout_ref.rollout.n)    
+        judge_batch_loser = select_loser(batch, n=self.config.actor_rollout_ref.rollout.n, mode='worst')    
+        judge_batch_loser.pop(batch_keys=['judge_responses', 'token_level_scores', 'rule_based_token_level_scores'], non_tensor_batch_keys=['rm_valids', 'raw_judge_texts'])
+        judge_batch_loser = self.actor_rollout_wg._build_judge_inputs(judge_batch_loser)
+
         # for each prompt, set the reference answer as golden response, build judge inputs and repeat rollout.n times
         judge_batch_ref = batch.slice(step=self.config.actor_rollout_ref.rollout.n)
         judge_batch_ref.non_tensor_batch['raw_response'] = np.asarray([
@@ -2158,25 +2226,12 @@ class RayDualPPOTrainer:
             }]
             for item in judge_batch_ref.non_tensor_batch['extra_info']
         ])
+        judge_batch_ref.pop(batch_keys=['judge_responses', 'token_level_scores', 'rule_based_token_level_scores'], non_tensor_batch_keys=['rm_valids', 'raw_judge_texts'])
         judge_batch_ref = self.actor_rollout_wg._build_judge_inputs(judge_batch_ref)
         judge_batch_ref.pop(non_tensor_batch_keys=['raw_response'])
-
-        # 3) LLM as a judge with actor1 on judge prompts
-        with marked_timer("gen: LLM-as-a-judge for actor", timing_raw, color="red"):
-            if not is_critic_warmup:   
-                gen_judge_batch = self._get_gen_batch(judge_batch)
-                gen_judge_batch.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
-                if not self.async_rollout_mode:  
-                    gen_judge_batch = self.actor_rollout_wg.generate_sequences(gen_judge_batch)
-                else:
-                    raise NotImplementedError("async rollout is not supported in dual-ppo trainer yet")
-                batch.batch['judge_responses'] = gen_judge_batch.batch['responses']
-                del gen_judge_batch
-            del judge_batch
     
 
-        # 4) Critique rollout with actor1
+        # 6) Critique rollout with actor1
         with marked_timer("gen: rollout for critic", timing_raw, color="red"):
             gen_judge_batch_loser = self._get_gen_batch(judge_batch_loser)
             gen_judge_batch_ref = self._get_gen_batch(judge_batch_ref)
@@ -2191,9 +2246,9 @@ class RayDualPPOTrainer:
                 )
 
                 gen_judge_batch_loser_output.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch_loser_output.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
+                gen_judge_batch_loser_output.meta_info["active_adapter"] = "actor1"
                 gen_judge_batch_ref_output.meta_info["global_steps"] = self.global_steps
-                gen_judge_batch_ref_output.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
+                gen_judge_batch_ref_output.meta_info["active_adapter"] = "actor1"
                 
                 if not self.async_rollout_mode:
                     gen_judge_batch_loser_output = self.actor_rollout_wg.generate_sequences(gen_judge_batch_loser_output)
@@ -2216,7 +2271,7 @@ class RayDualPPOTrainer:
                 )
                 concat_batch = DataProto.concat([gen_judge_batch_loser_output, gen_judge_batch_ref_output])
                 concat_batch.meta_info["global_steps"] = self.global_steps
-                concat_batch.meta_info["active_adapter"] = "actor1" if not is_critic_warmup else "actor1-only"
+                concat_batch.meta_info["active_adapter"] = "actor1"
                 if not self.async_rollout_mode:
                     concat_batch = self.actor_rollout_wg.generate_sequences(concat_batch)
                 else:
@@ -2239,41 +2294,8 @@ class RayDualPPOTrainer:
             judge_batch_loser.batch['judge_responses'] = judge_batch_loser.batch['responses']
             judge_batch_ref.batch['judge_responses'] = judge_batch_ref.batch['responses']
 
-        return batch, judge_batch_loser, judge_batch_ref
 
-
-    def _reward_phase(self, 
-                      batch_dict: dict,
-                      metrics: dict, timing_raw: dict, HALF: bool):
-        
-        is_last_step = self.global_steps >= self.total_training_steps
-        is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
-        batch = batch_dict['batch']
-        judge_batch_loser = batch_dict['judge_batch_loser']
-        judge_batch_ref = batch_dict['judge_batch_ref']
-
-        # compute critic model score for actor responses
-        if not is_critic_warmup:
-            reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
-            batch = batch.union(reward_tensor) 
-            rule_based_reward_tensor = self.reward_fn(batch, return_dict=False)
-            batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor
-
-            # some metrics for debugging
-            scores = batch.batch['token_level_scores'].sum(dim=-1)
-            scores_var = torch.var(scores.view((-1, self.config.actor_rollout_ref.rollout.n)), dim=-1).mean().item()
-            metrics['actor']['critic/score/var'] = scores_var
-            rule_based_scores = batch.batch['rule_based_token_level_scores'].sum(dim=-1)
-            def spearman_corr(x, y):
-                x_rank = torch.argsort(torch.argsort(x))
-                y_rank = torch.argsort(torch.argsort(y))
-                return torch.corrcoef(torch.stack([x_rank.float(), y_rank.float()]))[0, 1]
-            consistency = spearman_corr(scores, rule_based_scores).item()
-            metrics['actor']['critic/score/consistency_to_rule'] = consistency
-            
-            # mix rule-based reward into critic score
-            batch.batch['token_level_scores'] += batch.batch['rule_based_token_level_scores']
-
+        # 7) Compute rewards for critique answers
         reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_loser)
         judge_batch_loser = judge_batch_loser.union(reward_tensor) 
         judge_batch_loser.batch['rule_based_token_level_scores'] = judge_batch_loser.batch['token_level_scores']
@@ -2284,138 +2306,160 @@ class RayDualPPOTrainer:
 
         compute_GAN_like_reward(judge_batch_loser, judge_batch_ref)
 
+        return batch, judge_batch_loser, judge_batch_ref
+
+
+    # def _reward_phase(self, 
+    #                   batch_dict: dict,
+    #                   metrics: dict, timing_raw: dict, HALF: bool):
+        
+    #     is_last_step = self.global_steps >= self.total_training_steps
+    #     is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
+    #     batch = batch_dict['batch']
+    #     judge_batch_loser = batch_dict['judge_batch_loser']
+    #     judge_batch_ref = batch_dict['judge_batch_ref']
+
+    #     # compute critic model score for actor responses
+    #     if not is_critic_warmup:
+    #         reward_tensor = self.actor_rollout_wg.compute_rm_score(batch)
+    #         batch = batch.union(reward_tensor) 
+    #         rule_based_reward_tensor = self.reward_fn(batch, return_dict=False)
+    #         batch.batch['rule_based_token_level_scores'] = rule_based_reward_tensor
+
+    #         # some metrics for debugging
+    #         scores = batch.batch['token_level_scores'].sum(dim=-1)
+    #         scores_var = torch.var(scores.view((-1, self.config.actor_rollout_ref.rollout.n)), dim=-1).mean().item()
+    #         metrics['actor']['critic/score/var'] = scores_var
+    #         rule_based_scores = batch.batch['rule_based_token_level_scores'].sum(dim=-1)
+    #         def spearman_corr(x, y):
+    #             x_rank = torch.argsort(torch.argsort(x))
+    #             y_rank = torch.argsort(torch.argsort(y))
+    #             return torch.corrcoef(torch.stack([x_rank.float(), y_rank.float()]))[0, 1]
+    #         consistency = spearman_corr(scores, rule_based_scores).item()
+    #         metrics['actor']['critic/score/consistency_to_rule'] = consistency
+            
+    #         # mix rule-based reward into critic score
+    #         batch.batch['token_level_scores'] += batch.batch['rule_based_token_level_scores']
+
+    #     reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_loser)
+    #     judge_batch_loser = judge_batch_loser.union(reward_tensor) 
+    #     judge_batch_loser.batch['rule_based_token_level_scores'] = judge_batch_loser.batch['token_level_scores']
+
+    #     reward_tensor = self.actor_rollout_wg.compute_rm_score(judge_batch_ref)
+    #     judge_batch_ref = judge_batch_ref.union(reward_tensor)   
+    #     judge_batch_ref.batch['rule_based_token_level_scores'] = judge_batch_ref.batch['token_level_scores']
+
+    #     compute_GAN_like_reward(judge_batch_loser, judge_batch_ref)
+
 
     def _log_prob_phase(self, 
-                        batch_dict: dict,
-                        metrics: dict, timing_raw: dict, HALF: bool):
+                        batch_: DataProto,
+                        metrics_: dict, timing_raw: dict):
         
-        batch = batch_dict['batch']
-        judge_batch_loser = batch_dict['judge_batch_loser']
-        judge_batch_ref = batch_dict['judge_batch_ref']
-        
-        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
-            for batch_, metrics_ in iter_list:
-                with self._balance_batch_context(batch_, metrics_):
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+        # Operating Mode Selection:
+        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+            from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
 
-                        apply_rollout_correction(
-                            batch=batch_,
-                            rollout_corr_config=rollout_corr_config,
-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                        )
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch_)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch_.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
-                            )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics_.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch_ = batch_.union(old_log_prob)
-                            if "rollout_log_probs" in batch_.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+            apply_rollout_correction(
+                batch=batch_,
+                rollout_corr_config=rollout_corr_config,
+                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+            )
+        else:  # Recompute old_log_probs
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch_)
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch_.batch["response_mask"]
+                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                entropy_agg = agg_loss(
+                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                )
+                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                metrics_.update(old_log_prob_metrics)
+                old_log_prob.batch.pop("entropys")
+                batch_ = batch_.union(old_log_prob)
+                if "rollout_log_probs" in batch_.batch.keys():
+                    # TODO: we may want to add diff of probs too.
+                    from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics_.update(calculate_debug_metrics(batch_))
+                    metrics_.update(calculate_debug_metrics(batch_))
 
-                    assert "old_log_probs" in batch_.batch, f'"old_log_prob" not in {batch_.batch.keys()=}'
+        assert "old_log_probs" in batch_.batch, f'"old_log_prob" not in {batch_.batch.keys()=}'
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch_)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch_)
-                            batch_ = batch_.union(ref_log_prob)
+        if self.use_reference_policy:
+            # compute reference log_prob
+            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch_)
+                else:
+                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch_)
+                batch_ = batch_.union(ref_log_prob)
 
     
     def _adv_phase(self, 
-                   batch_dict: dict,
-                   metrics: dict, timing_raw: dict, HALF: bool):
-
-        batch = batch_dict['batch']
-        judge_batch_loser = batch_dict['judge_batch_loser']
-        judge_batch_ref = batch_dict['judge_batch_ref']
+                   batch_: DataProto,
+                   metrics_: dict, timing_raw: dict):
         
-        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
-            for batch_, metrics_ in iter_list:
-                with self._balance_batch_context(batch_, metrics_):
-                    # compute rewards. apply_kl_penalty if available
-                    if self.config.algorithm.use_kl_in_reward:
-                        batch_, kl_metrics = apply_kl_penalty(
-                            batch_, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                        )
-                        metrics_.update(kl_metrics)
-                    else:
-                        batch_.batch["token_level_rewards"] = batch_.batch["token_level_scores"]
+        with marked_timer("adv", timing_raw, color="brown"):
+            # compute rewards. apply_kl_penalty if available
+            if self.config.algorithm.use_kl_in_reward:
+                batch_, kl_metrics = apply_kl_penalty(
+                    batch_, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                )
+                metrics_.update(kl_metrics)
+            else:
+                batch_.batch["token_level_rewards"] = batch_.batch["token_level_scores"]
 
-                    # Compute rollout correction: IS weights, rejection sampling, and metrics
-                    # Only runs in decoupled mode (computes once per batch using stable π_old)
-                    # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                    # Operating Mode Selection:
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if (
-                        rollout_corr_config is not None
-                        and "rollout_log_probs" in batch_.batch
-                        and not bypass_recomputing_logprobs  # Only in decoupled mode
-                    ):
-                        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+            # Compute rollout correction: IS weights, rejection sampling, and metrics
+            # Only runs in decoupled mode (computes once per batch using stable π_old)
+            # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+            # Operating Mode Selection:
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+            if (
+                rollout_corr_config is not None
+                and "rollout_log_probs" in batch_.batch
+                and not bypass_recomputing_logprobs  # Only in decoupled mode
+            ):
+                from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 
-                        # Compute IS weights, apply rejection sampling, compute metrics
-                        batch_, is_metrics = compute_rollout_correction_and_add_to_batch(batch_, rollout_corr_config)
-                        # IS and off-policy metrics already have rollout_corr/ prefix
-                        metrics_.update(is_metrics)
+                # Compute IS weights, apply rejection sampling, compute metrics
+                batch_, is_metrics = compute_rollout_correction_and_add_to_batch(batch_, rollout_corr_config)
+                # IS and off-policy metrics already have rollout_corr/ prefix
+                metrics_.update(is_metrics)
 
-                    # compute advantages, executed on the driver process
-                    norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                        "norm_adv_by_std_in_grpo", True
-                    )  # GRPO adv normalization factor
+            # compute advantages, executed on the driver process
+            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                "norm_adv_by_std_in_grpo", True
+            )  # GRPO adv normalization factor
 
-                    batch_ = compute_advantage(
-                        batch_,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                        num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                        config=self.config.algorithm,
-                    )
+            batch_ = compute_advantage(
+                batch_,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=self.config.algorithm,
+            )
 
 
     def _update_phase(self, 
-                      batch_dict: dict,
-                      metrics: dict, timing_raw: dict, HALF: bool):
+                      batch_: DataProto,
+                      metrics_: dict, timing_raw: dict):
 
-        batch = batch_dict['batch']
-        judge_batch_loser = batch_dict['judge_batch_loser']
-        judge_batch_ref = batch_dict['judge_batch_ref']
-        
-        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
-            for batch_, metrics_ in iter_list:
-                with self._balance_batch_context(batch_, metrics_):
-                    batch_.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                    batch_.meta_info["global_token_num"] = torch.sum(batch_.batch["attention_mask"], dim=-1).tolist()
-                    actor_output = self.actor_rollout_wg.update_actor(batch_)
-                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                    metrics_.update(actor_output_metrics)
+        with marked_timer("update_actor", timing_raw, color="red"):
+            batch_.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+            batch_.meta_info["global_token_num"] = torch.sum(batch_.batch["attention_mask"], dim=-1).tolist()
+            actor_output = self.actor_rollout_wg.update_actor(batch_)
+            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics_.update(actor_output_metrics)
 
-        judge_batch_loser.meta_info["global_token_num"] = torch.sum(judge_batch_loser.batch["attention_mask"], dim=-1).tolist()
-        judge_batch_ref.meta_info["global_token_num"] = torch.sum(judge_batch_ref.batch["attention_mask"], dim=-1).tolist()
-
-        
 
     def fit(self):
         """
@@ -2495,7 +2539,7 @@ class RayDualPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                # breakpoint()
+                breakpoint()
                 ##################### STEP START #####################
                 is_last_step = self.global_steps >= self.total_training_steps
                 is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
@@ -2505,6 +2549,10 @@ class RayDualPPOTrainer:
                         batch, judge_batch_loser, judge_batch_ref = self._rollout_phase(
                             batch, metrics, timing_raw, HALF=HALF
                         )
+
+                        # only use critic model to guide actor update after warmup. otherwise only use rule-based reward.
+                        if not is_critic_warmup:
+                            batch.batch['token_level_scores'] += batch.batch['rule_based_token_level_scores']
 
                         for batch_, metrics_ in [
                             (batch, metrics["actor"]), 
@@ -2522,50 +2570,45 @@ class RayDualPPOTrainer:
                             #    self._balance_batch(batch_, metrics=metrics_, mode='sequence')
 
                         batch.meta_info['active_adapter'] = 'actor2'  # set active adapter back to actor2
-                        judge_batch_loser.meta_info['active_adapter'] = 'actor1' if not is_critic_warmup else 'actor1-only'  # set active adapter back to actor1
-                        judge_batch_ref.meta_info['active_adapter'] = 'actor1' if not is_critic_warmup else 'actor1-only'  # set active adapter back to actor1
+                        judge_batch_loser.meta_info['active_adapter'] = 'actor1' # set active adapter back to actor1
+                        judge_batch_ref.meta_info['active_adapter'] = 'actor1' # set active adapter back to actor1
                         batch_dict = {
                             'batch': batch,
                             'judge_batch_loser': judge_batch_loser,
                             'judge_batch_ref': judge_batch_ref
                         }
-                        # 2) Reward phase: compute rewards using reward model   
-                        with marked_timer("reward", timing_raw, color="yellow"):
-                            self._reward_phase(
-                                batch_dict, 
-                                metrics, 
-                                timing_raw, 
-                                HALF=HALF
-                            )
 
-                        #breakpoint()
+                        with self._get_iteration_list(batch_dict, metrics, HALF) as iter_list:
+                            for batch_, metrics_ in iter_list:
+                                with self._balance_batch_context(batch_, metrics_):
+                                    # 2) Log prob phase: compute log probs and values
+                                    self._log_prob_phase(
+                                        batch_, 
+                                        metrics_, 
+                                        timing_raw, 
+                                    )
+
+                                    # 3) Advantage phase: compute advantages
+                                    self._adv_phase(
+                                        batch_, 
+                                        metrics_, 
+                                        timing_raw, 
+                                    )
+
+                                    # 4) Update phase: update actor model
+                                    self._update_phase(
+                                        batch_, 
+                                        metrics_, 
+                                        timing_raw
+                                    )
+
+                        batch = batch_dict['batch']
+                        judge_batch_loser = batch_dict['judge_batch_loser']
+                        judge_batch_ref = batch_dict['judge_batch_ref']
+                        judge_batch_loser.meta_info["global_token_num"] = torch.sum(judge_batch_loser.batch["attention_mask"], dim=-1).tolist()
+                        judge_batch_ref.meta_info["global_token_num"] = torch.sum(judge_batch_ref.batch["attention_mask"], dim=-1).tolist()
 
 
-                        # 3) Log prob phase: compute log probs and values
-                        self._log_prob_phase(
-                            batch_dict, 
-                            metrics, 
-                            timing_raw, 
-                            HALF=HALF
-                        )
-
-                        # 4) Advantage phase: compute advantages
-                        with marked_timer("adv", timing_raw, color="brown"):
-                            self._adv_phase(
-                                batch_dict, 
-                                metrics, 
-                                timing_raw, 
-                                HALF=HALF
-                            )
-
-                        # 5) Update phase: update actor model
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            self._update_phase(
-                                batch_dict, 
-                                metrics, 
-                                timing_raw, 
-                                HALF=HALF
-                            )
                 except Exception as e:
                     if "out of memory" in str(e):
                         print(f"Warning: Caught out of memory error at global step {self.global_steps}, skipping this batch.")

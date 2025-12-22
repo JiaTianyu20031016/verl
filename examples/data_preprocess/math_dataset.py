@@ -77,12 +77,18 @@ if __name__ == "__main__":
             data_source,
         )
 
-    dataset = dataset.filter(lambda x: filter_by_level(x, levels=["Level 5"]))
+    # dataset = dataset.filter(lambda x: filter_by_level(x, levels=["Level 5"]))
 
     if "test" not in dataset:
         # split a small number of examples from train as test
         print("Splitting test set from train set...", flush=True)
-        dataset = dataset["train"].train_test_split(test_size=0.02, seed=42)
+        dataset = dataset["train"].train_test_split(test_size=0.2, seed=42)
+    elif "train" not in dataset:
+        # split a small number of examples from train as test
+        print("Splitting train set from test set...", flush=True)
+        dataset = dataset["test"].train_test_split(test_size=0.2, seed=42)
+    else:
+        raise ValueError("Dataset must have at least one of 'train' or 'test' split.")
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 

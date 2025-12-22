@@ -32,7 +32,7 @@ def extract_solution(solution_str):
     matches = regex.findall(pattern, solution_str, flags=regex.VERBOSE)
     if matches:
         return matches[-1]   # 返回最后一个 boxed 内容
-    return solution_str
+    return None
 
 
 _SOLUTION_CLIP_CHARS = 300
@@ -249,9 +249,21 @@ def compute_score(solution_str, ground_truth, format_score=0.0, score=1.0):
     """
     answer = extract_solution(solution_str=solution_str)
     if answer is None:
-        return 0
+        return {
+            'score': 0.0,
+            'format_score': 0.0,
+            'answer_extracted': False,
+        }
     else:
         if is_equiv(answer, ground_truth):
-            return score
+            return {
+                'score': score,
+                'format_score': format_score,
+                'answer_extracted': True,
+            }
         else:
-            return format_score
+            return {
+                'score': 0.0,
+                'format_score': format_score,
+                'answer_extracted': True,
+            }
