@@ -104,6 +104,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
     rule_based_sequence_score = batch.batch.get("rule_based_token_level_scores", None)
+    if rule_based_sequence_score is not None:
+        rule_based_sequence_score = rule_based_sequence_score.sum(-1)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]

@@ -1660,7 +1660,7 @@ class RayDualPPOTrainer:
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             # use actor2 for validation
-            test_gen_batch_padded.meta_info['active_adapter'] = 'actor2' if self.global_steps >= self.config.trainer.critic_warmup else 'actor1'
+            test_gen_batch_padded.meta_info['active_adapter'] = 'actor2'
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -2539,7 +2539,7 @@ class RayDualPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                breakpoint()
+                # breakpoint
                 ##################### STEP START #####################
                 is_last_step = self.global_steps >= self.total_training_steps
                 is_critic_warmup = self.global_steps < self.config.trainer.critic_warmup
@@ -2553,6 +2553,8 @@ class RayDualPPOTrainer:
                         # only use critic model to guide actor update after warmup. otherwise only use rule-based reward.
                         if not is_critic_warmup:
                             batch.batch['token_level_scores'] += batch.batch['rule_based_token_level_scores']
+                        else:
+                            batch.batch['token_level_scores'] = batch.batch['rule_based_token_level_scores']
 
                         for batch_, metrics_ in [
                             (batch, metrics["actor"]), 
